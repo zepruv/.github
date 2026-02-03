@@ -21,6 +21,10 @@
   <img src="https://img.shields.io/badge/📍_Made_in-India-FB923C?style=flat-square&labelColor=18181b" alt="India" />
 </p>
 
+<p>
+  Built and maintained by <a href="https://github.com/dinesh776"><b>@dinesh776</b></a>
+</p>
+
 <br />
 
 <!-- Hero Banner -->
@@ -178,6 +182,6 @@ A unified dashboard to manage all your referral requests.
 
 <br /><br />
 
-<sub>Designed & Built by **Zepruv Team**</sub>
+
 
 </div>
