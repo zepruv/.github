@@ -1,7 +1,7 @@
 <div align="center">
 
 <!-- Header with Logo -->
-<img src="profile/assets/logo.png" alt="Zepruv Logo" width="120" height="auto" />
+<img src="https://raw.githubusercontent.com/zepruv/.github/main/profile/assets/logo.png" alt="Zepruv Logo" width="120" height="auto" />
 
 # Zepruv
 
@@ -30,7 +30,7 @@
       <b>The Ultimate Collaborative Interview Preparation Platform</b>
       <br /><br />
       <img src="https://img.shields.io/badge/Mock_Interviews-Friends-F43F5E?style=flat-square" />
-      <img src="https://img.shields.io/badge/AI_Interviewer-GPT--4o-EC4899?style=flat-square" />
+      <img src="https://img.shields.io/badge/AI_Interviewer-Intelligent-EC4899?style=flat-square" />
       <img src="https://img.shields.io/badge/Competitive_Coding-LeetCode_Style-FB7185?style=flat-square" />
       <img src="https://img.shields.io/badge/Expert_Marketplace-Book_Mentors-FDA4AF?style=flat-square" />
     </td>
