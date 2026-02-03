@@ -1,7 +1,7 @@
 <div align="center">
 
 <!-- Header with Logo -->
-<img src="https://raw.githubusercontent.com/zepruv/.github/main/profile/assets/logo.svg" alt="Zepruv" width="80" height="80" />
+<img src="profile/assets/logo.png" alt="Zepruv Logo" width="120" height="auto" />
 
 # Zepruv
 
@@ -26,13 +26,13 @@
 <!-- Hero Banner -->
 <table>
   <tr>
-    <td>
-      <img src="https://img.shields.io/badge/-The_all--in--one_platform_for_students_and_professionals-18181b?style=for-the-badge" />
+    <td align="center">
+      <b>The Ultimate Collaborative Interview Preparation Platform</b>
       <br /><br />
-      <img src="https://img.shields.io/badge/Practice_with_Friends-F43F5E?style=flat-square" />
-      <img src="https://img.shields.io/badge/AI_Mock_Interviews-EC4899?style=flat-square" />
-      <img src="https://img.shields.io/badge/Expert_Marketplace-FB7185?style=flat-square" />
-      <img src="https://img.shields.io/badge/Referral_Management-FDA4AF?style=flat-square" />
+      <img src="https://img.shields.io/badge/Mock_Interviews-Friends-F43F5E?style=flat-square" />
+      <img src="https://img.shields.io/badge/AI_Interviewer-GPT--4o-EC4899?style=flat-square" />
+      <img src="https://img.shields.io/badge/Competitive_Coding-LeetCode_Style-FB7185?style=flat-square" />
+      <img src="https://img.shields.io/badge/Expert_Marketplace-Book_Mentors-FDA4AF?style=flat-square" />
     </td>
   </tr>
 </table>
@@ -45,36 +45,35 @@
 
 <br />
 
-<!-- Features Section -->
+<!-- Main Features Grid -->
 <table>
 <tr>
 <td width="50%" valign="top">
 
 ### 👥 Mock Interviews with Friends
 
-Practice with friends in a **real interview setup**:
+Simulate real interviews with your peers using our comprehensive suite of tools. No more screen sharing or switching tabs.
 
-| Tool | Description |
-|:-----|:------------|
-| 📹 **Live Video** | Face-to-face interview simulation |
-| 💻 **Code Editor** | Java, C, C++, Python, JS, Rust |
-| 🏗️ **System Design** | Drag-and-drop architecture |
-| ✏️ **Whiteboard** | Diagrams & flowcharts |
-| 📝 **Question Bank** | Curated problems with test cases |
+| Feature | Details |
+|:---|:---|
+| 📹 **HD Video Call** | Low-latency face-to-face interaction |
+| 💻 **Code Editor** | Real-time collaboration in 6+ languages |
+| 🎨 **Whiteboard** | Draw diagrams & explain logic visually |
+| 🏗️ **System Design** | Drag-and-drop architecture canvas |
 
 </td>
 <td width="50%" valign="top">
 
 ### 🤖 AI Mock Interviews
 
-Practice **anytime, anywhere**:
+Master your interview skills with our intelligent AI interviewer that adapts to your performance.
 
-| Feature | Benefit |
-|:--------|:--------|
-| 🎯 **Realistic** | Real interview experience |
-| ⚡ **Instant** | Immediate feedback & scoring |
-| 📈 **Adaptive** | Adjusts to your level |
-| 🕐 **24/7** | No scheduling needed |
+| Feature | Details |
+|:---|:---|
+| 🕐 **Available 24/7** | Practice whenever you want |
+| ⚡ **Instant Feedback** | Detailed scoring & improvement tips |
+| 🗣️ **Natural Voice** | Conversational interaction |
+| 📊 **Analytics** | Track your progress over time |
 
 </td>
 </tr>
@@ -82,30 +81,59 @@ Practice **anytime, anywhere**:
 
 <br />
 
+<!-- Toolkit Section -->
+### 🧰 The Interview Toolkit
+
+Every tool you need to crack the toughest technical rounds, integrated into one seamless experience.
+
+<table>
+<tr>
+<td width="33%" align="center">
+  <h4>� Collaborative Code Editor</h4>
+  Support for <b>Java, Python, C++, JavaScript, Rust, Go</b>. Real-time syntax highlighting, execution, and test cases.
+</td>
+<td width="33%" align="center">
+  <h4>🏗️ System Design Canvas</h4>
+  Professional-grade diagramming tool with pre-built components for designing scalable architectures.
+</td>
+<td width="33%" align="center">
+  <h4>📝 Competitive Coding</h4>
+  Access a vast library of <b>LeetCode-style questions</b>. Solve problems with test cases, time limits, and edge cases.
+</td>
+</tr>
+</table>
+
+<br />
+
+---
+
+<br />
+
+<!-- Marketplace & Referral Section -->
 <table>
 <tr>
 <td width="50%" valign="top">
 
 ### 💼 Expert Marketplace
 
-Book sessions with **verified professionals**:
+**Get mentored by the best.**
 
-- Engineers from **Google, Microsoft, Amazon** & more
-- Real feedback from actual interviewers
-- Browse by: `DSA` `System Design` `Frontend` `Backend`
-- Competitive pricing per session
+Book 1:1 sessions with verified engineers from top tech companies.
+- 🏢 Mentors from **Google, Amazon, Microsoft**
+- 🎯 Specialized mock interviews (Frontend, Backend, System Design)
+- 📝 Actionable feedback & carrier guidance
 
 </td>
 <td width="50%" valign="top">
 
 ### 📋 Referral Management
 
-Track all your **referral requests**:
+**Land your dream job.**
 
-- 🔍 Find professionals who can refer you
-- 📤 Send requests based on performance
-- ✅ Track status: Pending → Accepted
-- 📊 Never lose track of opportunities
+A unified dashboard to manage all your referral requests.
+- 🔍 Connect with professionals for referrals
+- � Showcase your mock interview scores
+- ✅ Track request status from pending to hired
 
 </td>
 </tr>
@@ -120,17 +148,14 @@ Track all your **referral requests**:
 <!-- Tech Stack -->
 <div align="center">
 
-### 🛠️ Built With
+### 🛠️ Built With Modern Tech
 
 <br />
 
-<img src="https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white" />
-<img src="https://img.shields.io/badge/Spring_Boot-6DB33F?style=for-the-badge&logo=springboot&logoColor=white" />
-<img src="https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" />
-<img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" />
-<img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
-<img src="https://img.shields.io/badge/MySQL-4479A1?style=for-the-badge&logo=mysql&logoColor=white" />
-<img src="https://img.shields.io/badge/Redis-DC382D?style=for-the-badge&logo=redis&logoColor=white" />
+<img src="https://img.shields.io/badge/Frontend-React_&_Shadcn-61DAFB?style=for-the-badge&logo=react&logoColor=black" />
+<img src="https://img.shields.io/badge/Backend-Spring_Boot-6DB33F?style=for-the-badge&logo=springboot&logoColor=white" />
+<img src="https://img.shields.io/badge/AI-Python_&_OpenAI-3776AB?style=for-the-badge&logo=python&logoColor=white" />
+<img src="https://img.shields.io/badge/Infra-Docker_&_Redis-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
 
 </div>
 
@@ -140,57 +165,19 @@ Track all your **referral requests**:
 
 <br />
 
-<!-- Who is it for -->
+<!-- Footer CTA -->
 <div align="center">
 
-### � Who is Zepruv for?
-
-<br />
-
-<table>
-<tr>
-<td align="center" width="50%">
-  <h4>🎓 Students</h4>
-  
-  ✓ Practice with classmates<br />
-  ✓ Build placement confidence<br />
-  ✓ Get industry referrals<br />
-  ✓ Track your progress
-</td>
-<td align="center" width="50%">
-  <h4>💼 Professionals</h4>
-  
-  ✓ Sharpen interview skills<br />
-  ✓ Earn by helping others<br />
-  ✓ Give back to community<br />
-  ✓ Build your brand
-</td>
-</tr>
-</table>
-
-</div>
-
-<br />
-
----
-
-<br />
-
-<!-- CTA -->
-<div align="center">
-
-### � Ready to ace your next interview?
+### 🚀 Ready to level up your interview game?
 
 <br />
 
 <a href="https://zepruv.me">
-  <img src="https://img.shields.io/badge/Get_Started_Free-F43F5E?style=for-the-badge&logoColor=white" alt="Get Started" />
+  <img src="https://img.shields.io/badge/Start_Practicing_Free-F43F5E?style=for-the-badge&logoColor=white" alt="Get Started" />
 </a>
 
 <br /><br />
 
-<sub>**Built with ❤️ by the Zepruv Team**</sub>
-
-<sub>*From preparation to placement — we've got you covered*</sub>
+<sub>Designed & Built by **Zepruv Team**</sub>
 
 </div>

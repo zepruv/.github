@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="zepruv-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#E11D48;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#BE123C;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <!-- Shell/Shield shape representing Zepruv -->
+  <path d="M50 5 L90 25 L90 55 C90 75 70 90 50 95 C30 90 10 75 10 55 L10 25 Z" fill="url(#zepruv-gradient)"/>
+  <!-- Z letter inside -->
+  <path d="M30 30 L70 30 L70 38 L42 62 L70 62 L70 70 L30 70 L30 62 L58 38 L30 38 Z" fill="white"/>
+</svg>
