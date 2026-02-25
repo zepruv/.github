@@ -6,7 +6,7 @@
 # Zepruv
 
 <h3>
-  <em>Where Practice Becomes Placement</em>
+  <em>Where Practice Becomes Success</em>
 </h3>
 
 <p align="center">
