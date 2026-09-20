@@ -131,5 +131,5 @@ All repositories follow enterprise CI/CD standards:
 ---
 
 <div align="center">
-  <sub>Built with ❤️ in India 🇮🇳 · Founded 2024</sub>
+  <sub>Built with ❤️ in India 🇮🇳 · Founded 2026</sub>
 </div>
