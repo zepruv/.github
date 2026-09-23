@@ -1,0 +1,350 @@
+name: "Reusable: build, promote and deploy a service"
+
+# Build once, promote the same image:
+#   staging  builds the image for the commit, pushes it to ECR (tag sha-<12>), deploys it, and on success adds the ECR
+#            marker tag  staging-ok-<12>.
+#   prod     never builds. It deploys an image that already carries the staging-ok marker, and only if that commit is
+#            on `main` (ancestor, or identical tree for squash merges). This is the promotion gate that GitHub
+#            branch protection would normally provide, done in the workflow so it works on the Free plan.
+#
+# Deploys are serialised per environment+service, run scripts/deploy-service.sh on the server over SSH with a pinned
+# host key, verify health, and roll back automatically if the new container is not healthy.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "staging | prod"
+        type: string
+        required: true
+      service:
+        description: "docker compose service name, e.g. backend-server"
+        type: string
+        required: true
+      ecr_repository:
+        description: "e.g. zepruv-backend"
+        type: string
+        required: true
+      tag_var:
+        description: ".env variable holding this service's image tag, e.g. BACKEND_TAG"
+        type: string
+        required: true
+      context:
+        type: string
+        default: "."
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      build_args:
+        type: string
+        default: ""
+      profile:
+        description: "compose profile the service belongs to (e.g. full)"
+        type: string
+        default: ""
+      set_release:
+        description: "also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)"
+        type: boolean
+        default: false
+      health_url:
+        description: "optional public URL that must answer 200 after the deploy"
+        type: string
+        default: ""
+      staging_sha:
+        description: "prod only: commit to promote. Empty = newest staging-verified commit that is on main"
+        type: string
+        default: ""
+      aws_region:
+        type: string
+        default: "ap-south-2"
+      dd_site:
+        type: string
+        default: "us5.datadoghq.com"
+    secrets:
+      AWS_ROLE_ARN:
+        description: "IAM role for GitHub OIDC (preferred)"
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_KNOWN_HOSTS:
+        description: "output of: ssh-keyscan -t ed25519 <host>"
+        required: true
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: false
+      DD_API_KEY:
+        description: "optional: posts a deployment event to Datadog"
+        required: false
+    outputs:
+      image_tag:
+        value: ${{ jobs.resolve.outputs.tag }}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      tag: ${{ steps.r.outputs.tag }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+
+      - id: r
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          REPO: ${{ inputs.ecr_repository }}
+          INPUT_SHA: ${{ inputs.staging_sha }}
+          CURRENT_SHA: ${{ github.sha }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          image_exists() { aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" >/dev/null 2>&1; }
+          on_main() {  # commit is contained in main, or main has exactly its content (squash merge)
+            git merge-base --is-ancestor "$1" origin/main 2>/dev/null && return 0
+            local a b
+            a="$(git rev-parse "$1"'^{tree}')"
+            b="$(git rev-parse 'origin/main^{tree}')"
+            [ "$a" = "$b" ]
+          }
+
+          case "$ENV_NAME" in
+            staging)
+              SHA="$CURRENT_SHA"
+              TAG="sha-${SHA:0:12}"
+              if image_exists "$TAG"; then BUILD=false; else BUILD=true; fi
+              ;;
+            prod)
+              git fetch --quiet origin main
+              BUILD=false
+              SHA=""
+              if [ -n "$INPUT_SHA" ]; then
+                [[ "$INPUT_SHA" =~ ^[0-9a-f]{12,40}$ ]] || { echo "::error::staging_sha must be 12-40 hex chars"; exit 1; }
+                SHA="$(git rev-parse --verify "$INPUT_SHA"'^{commit}')"
+              else
+                while read -r marker; do
+                  [ -n "$marker" ] || continue
+                  candidate="$(git rev-parse --verify --quiet "${marker#staging-ok-}"'^{commit}' || true)"
+                  [ -n "$candidate" ] || continue
+                  if on_main "$candidate"; then SHA="$candidate"; break; fi
+                done < <(aws ecr describe-images --repository-name "$REPO" \
+                           --query 'sort_by(imageDetails,&imagePushedAt)[].imageTags[]' --output text | tr '\t' '\n' | grep '^staging-ok-' | tac)
+              fi
+              [ -n "$SHA" ] || { echo "::error::No staging-verified image found whose commit is on main. Deploy the change to staging first, then merge staging into main."; exit 1; }
+              TAG="sha-${SHA:0:12}"
+              image_exists "staging-ok-${SHA:0:12}" || { echo "::error::Commit ${SHA:0:12} was never verified on staging (marker staging-ok-${SHA:0:12} missing in ECR)."; exit 1; }
+              image_exists "$TAG" || { echo "::error::Image $TAG missing in ECR."; exit 1; }
+              on_main "$SHA" || { echo "::error::Commit ${SHA:0:12} is not on main. Merge staging into main first."; exit 1; }
+              ;;
+            *) echo "::error::environment must be staging or prod"; exit 1 ;;
+          esac
+
+          {
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deploy plan"
+            echo "- environment: **$ENV_NAME**"
+            echo "- service: \`${{ inputs.service }}\`"
+            echo "- commit: \`${SHA:0:12}\`"
+            echo "- image: \`$REPO:$TAG\` (build needed: $BUILD)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and push image
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ needs.resolve.outputs.tag }}
+          build-args: |
+            APP_RELEASE=${{ needs.resolve.outputs.tag }}
+            ${{ inputs.build_args }}
+          cache-from: type=gha,scope=${{ inputs.ecr_repository }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.ecr_repository }}
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs: [resolve, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+
+      - name: Deploy over SSH
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          TAG_VAR: ${{ inputs.tag_var }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PROFILE: ${{ inputs.profile }}
+          SET_RELEASE: ${{ inputs.set_release }}
+          REGION: ${{ inputs.aws_region }}
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+          ECR_PASSWORD="$(aws ecr get-login-password --region "$REGION")"
+          echo "::add-mask::$ECR_PASSWORD"
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
+
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+          remote_args=(--env "$ENV_NAME" --service "$SERVICE" --tag-var "$TAG_VAR" --tag "$TAG" --registry "$REGISTRY")
+          [ -n "$PROFILE" ] && remote_args+=(--profile "$PROFILE")
+          [ "$SET_RELEASE" = "true" ] && remote_args+=(--set-release)
+          printf -v REMOTE_ARGS '%q ' "${remote_args[@]}"
+
+          # The password is the first stdin line (never a command-line argument); the rest of stdin is the script.
+          { printf '%s\n' "$ECR_PASSWORD"; cat .ci/scripts/deploy-service.sh; } | ssh \
+            -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+            "${SSH_USER:-ubuntu}@${HOST}" \
+            "IFS= read -r ECR_PASSWORD; export ECR_PASSWORD; bash -s -- ${REMOTE_ARGS}"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f "$HOME/.ssh/deploy_key"
+
+  verify:
+    name: Verify public health
+    needs: [resolve, deploy]
+    if: ${{ inputs.health_url != '' && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for HTTP 200
+        env:
+          URL: ${{ inputs.health_url }}
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 10 -o /dev/null "$URL"; then echo "healthy: $URL"; exit 0; fi
+            echo "attempt $i/12 failed; retrying in 10s"; sleep 10
+          done
+          echo "::error::$URL did not return 200 after the deploy"; exit 1
+
+  mark-verified:
+    name: Mark image as verified on staging
+    needs: [resolve, deploy, verify]
+    if: ${{ inputs.environment == 'staging' && !cancelled() && needs.deploy.result == 'success' && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+      - name: Add staging-ok marker tag
+        env:
+          REPO: ${{ inputs.ecr_repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MARKER="staging-ok-${SHA:0:12}"
+          if aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$MARKER" >/dev/null 2>&1; then
+            echo "$MARKER already present"; exit 0
+          fi
+          MANIFEST="$(aws ecr batch-get-image --repository-name "$REPO" --image-ids "imageTag=$TAG" --query 'images[0].imageManifest' --output text)"
+          aws ecr put-image --repository-name "$REPO" --image-tag "$MARKER" --image-manifest "$MANIFEST" >/dev/null
+          echo "Tagged $REPO:$TAG as $MARKER: this commit can now be promoted to prod."
+
+  datadog-event:
+    name: Datadog deployment event
+    needs: [resolve, deploy]
+    if: ${{ always() && needs.deploy.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+    steps:
+      - name: Post event (optional)
+        if: ${{ env.DD_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          DD_SITE: ${{ inputs.dd_site }}
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          RESULT: ${{ needs.deploy.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$RESULT" = "success" ]; then TYPE=success; else TYPE=error; fi
+          payload="$(jq -n --arg t "Deploy $SERVICE to $ENV_NAME: $RESULT" --arg x "Version $TAG. $RUN_URL" \
+            --arg env "env:$ENV_NAME" --arg svc "service:$SERVICE" --arg ver "version:$TAG" --arg type "$TYPE" \
+            '{title:$t, text:$x, alert_type:$type, tags:[$env,$svc,$ver,"source:github-actions"]}')"
+          curl -fsS -X POST "https://api.${DD_SITE}/api/v1/events" -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${DD_API_KEY}" -d "$payload" >/dev/null

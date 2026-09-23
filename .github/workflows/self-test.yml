@@ -1,0 +1,63 @@
+name: Self test
+
+# Validates the shared CI/CD machinery itself. Everything that runs in every service's pipeline lives here, so a broken
+# change here breaks all repos: it must pass before merging.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python unit tests
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Shell script tests
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends shellcheck >/dev/null
+          shellcheck scripts/*.sh
+          bash scripts/test_deploy_service.sh
+          bash scripts/test_infra_apply.sh
+          bash scripts/test_promotion_gate.sh
+
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          v=1.7.7
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${v}/actionlint_${v}_linux_amd64.tar.gz" -o al.tgz
+          tar -xzf al.tgz actionlint
+          ./actionlint -color
+  secrets-in-this-repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          v=8.24.0
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" -o gl.tgz
+          echo "cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4  gl.tgz" | sha256sum -c -
+          tar -xzf gl.tgz gitleaks
+          ./gitleaks detect --redact --no-banner
