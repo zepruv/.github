@@ -154,6 +154,12 @@ jobs:
         run: docker build --pull -t "ci/${{ inputs.service_name }}:${{ github.sha }}" -f "$CONTEXT/$DOCKERFILE" "$CONTEXT"
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        env:
+          # precise (default) only flags a CVE once the OS vendor has published its own advisory - Ubuntu's
+          # `universe` packages (ffmpeg and friends) mostly never get one without a paid ESM Apps subscription,
+          # so real CVEs sat invisible to this scan. comprehensive also checks upstream/NVD sources directly;
+          # trades toward more false positives to stop missing vendor-unconfirmed ones.
+          TRIVY_DETECTION_PRIORITY: comprehensive
         with:
           image-ref: ci/${{ inputs.service_name }}:${{ github.sha }}
           scanners: vuln
