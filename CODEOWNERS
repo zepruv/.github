@@ -1,0 +1,18 @@
+# This repo (zepruv/.github) supplies the reusable CI/CD workflows every Zepruv service pipeline calls via
+# `uses: zepruv/.github/.github/workflows/<file>.yml@main`, plus the shared composite actions and helper scripts
+# those workflows run on deploy. A change here takes effect for every consuming service's very next CI run,
+# with no separate review gate on the consumer side - so review of changes to it is concentrated on one owner
+# rather than left open to anyone with write access.
+#
+# This file only has teeth once branch protection on `main` has "Require review from Code Owners" enabled
+# (Settings > Branches > Branch protection rules > main), in addition to the existing required-approvals rule.
+# Patterns follow .gitignore syntax; the LAST matching pattern for a given file wins, so more specific rules
+# belong below broader ones.
+
+# Default: everything in this repo needs the infra owner's review.
+*                       @dinesh776
+
+# Called by every service's CI/CD - the highest-blast-radius paths.
+/.github/workflows/     @dinesh776
+/.github/actions/       @dinesh776
+/scripts/               @dinesh776
