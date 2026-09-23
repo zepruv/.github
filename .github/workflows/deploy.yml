@@ -54,6 +54,13 @@ on:
         description: "prod only: commit to promote. Empty = newest staging-verified commit that is on main"
         type: string
         default: ""
+      pull_extra:
+        description: >-
+          Space-separated "ecr_repo=local_tag" pairs pulled and re-tagged after this service's own deploy - for
+          images the deployed service's own code references by a bare local name, not an ECR path (e.g. judge's
+          sandbox execution images). Each repo must already exist and be pushed by this same workflow run's caller.
+        type: string
+        default: ""
       aws_region:
         type: string
         default: "ap-south-2"
@@ -240,6 +247,8 @@ jobs:
           SERVICE: ${{ inputs.service }}
           TAG_VAR: ${{ inputs.tag_var }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          PULL_EXTRA: ${{ inputs.pull_extra }}
           PROFILE: ${{ inputs.profile }}
           SET_RELEASE: ${{ inputs.set_release }}
           REGION: ${{ inputs.aws_region }}
@@ -259,8 +268,9 @@ jobs:
           chmod 600 "$HOME/.ssh/deploy_key"
           printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
 
-          remote_args=(--env "$ENV_NAME" --service "$SERVICE" --tag-var "$TAG_VAR" --tag "$TAG" --registry "$REGISTRY")
+          remote_args=(--env "$ENV_NAME" --service "$SERVICE" --tag-var "$TAG_VAR" --tag "$TAG" --registry "$REGISTRY" --ecr-repository "$ECR_REPOSITORY")
           [ -n "$PROFILE" ] && remote_args+=(--profile "$PROFILE")
+          [ -n "$PULL_EXTRA" ] && remote_args+=(--pull-extra "$PULL_EXTRA")
           [ "$SET_RELEASE" = "true" ] && remote_args+=(--set-release)
           printf -v REMOTE_ARGS '%q ' "${remote_args[@]}"
 

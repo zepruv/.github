@@ -15,13 +15,20 @@
 #   --tag-var <NAME_TAG>          .env variable that holds this service's image tag, e.g. BACKEND_TAG
 #   --tag <image tag>             immutable tag to deploy (e.g. staging-42-a1b2c3d)
 #   --registry <ecr registry>     e.g. 123456789012.dkr.ecr.ap-south-2.amazonaws.com
+#   --ecr-repository <name>       e.g. zepruv-backend (bare repo name, no registry/tag) - used only to find this
+#                                  service's own old local images for retention pruning; harmless to omit (skips it)
 #   [--profile <name>]            compose profile the service belongs to (e.g. full)
 #   [--set-release]               also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)
 #   [--wait <seconds>]            health wait, default 180
+#   [--keep <n>]                  local tagged images of this repo to retain (newest N), default 3
+#   [--pull-extra "repo=local ..."]  space-separated repo=localtag pairs pulled (and re-tagged to localtag) after
+#                                  the main service deploy - e.g. judge's sandbox images, which its own code
+#                                  references by a bare local name (docker-images/build-all.sh's local tags), not
+#                                  by ECR path. Failure to pull one is non-fatal (logged, does not fail the deploy).
 set -euo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/zepruv/deploy/environments}"
-ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" PROFILE="" SET_RELEASE=0 WAIT_SECONDS=180
+ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" SET_RELEASE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
 
 die() { echo "deploy-service: $*" >&2; exit 1; }
 
@@ -32,9 +39,12 @@ while [ $# -gt 0 ]; do
     --tag-var) TAG_VAR="${2:-}"; shift 2 ;;
     --tag) TAG="${2:-}"; shift 2 ;;
     --registry) REGISTRY="${2:-}"; shift 2 ;;
+    --ecr-repository) ECR_REPOSITORY="${2:-}"; shift 2 ;;
     --profile) PROFILE="${2:-}"; shift 2 ;;
     --set-release) SET_RELEASE=1; shift ;;
     --wait) WAIT_SECONDS="${2:-}"; shift 2 ;;
+    --keep) KEEP_IMAGES="${2:-}"; shift 2 ;;
+    --pull-extra) PULL_EXTRA="${2:-}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -45,8 +55,13 @@ done
 [[ "$TAG_VAR" =~ ^[A-Z][A-Z0-9_]*_TAG$ ]] || die "invalid --tag-var (expected NAME_TAG)"
 [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "invalid --tag"
 [[ "$REGISTRY" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$ ]] || die "invalid --registry"
+[[ -z "$ECR_REPOSITORY" || "$ECR_REPOSITORY" =~ ^[a-z0-9][a-z0-9._-]{0,254}$ ]] || die "invalid --ecr-repository"
 [[ -z "$PROFILE" || "$PROFILE" =~ ^[a-z0-9-]+$ ]] || die "invalid --profile"
 [[ "$WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "invalid --wait"
+[[ "$KEEP_IMAGES" =~ ^[0-9]{1,2}$ && "$KEEP_IMAGES" -ge 1 ]] || die "invalid --keep (must be >= 1)"
+for pair in $PULL_EXTRA; do
+  [[ "$pair" =~ ^[a-z0-9][a-z0-9._-]{0,254}=[a-z0-9][a-z0-9._-]{0,127}$ ]] || die "invalid --pull-extra entry: $pair (expected repo=localtag)"
+done
 [ -n "${ECR_PASSWORD:-}" ] || die "ECR_PASSWORD was not provided on stdin"
 
 DIR="$DEPLOY_ROOT/$ENV_NAME"
@@ -89,6 +104,36 @@ wait_healthy() {  # returns 0 when the container is healthy (or running for 20s 
   return 1
 }
 
+prune_old_tagged_images() {  # keeps the newest $KEEP_IMAGES *tagged* local images of $REGISTRY/$ECR_REPOSITORY
+  # `docker image prune` (below) only ever removes dangling (untagged) images - a repo:tag still has a name even
+  # once nothing references it, so every past deploy's image sits on disk forever unless something explicitly
+  # removes it. This is that something: list this service's own images newest-first, keep the top $KEEP_IMAGES,
+  # rmi the rest. $KEEP_IMAGES >= 2 always leaves the just-deployed tag and the previous one the rollback path
+  # in this script might still need.
+  [ -n "$ECR_REPOSITORY" ] || return 0
+  local repo="$REGISTRY/$ECR_REPOSITORY" old_ids
+  old_ids="$(docker images "$repo" --format '{{.CreatedAt}}|{{.ID}}' | sort -r | tail -n "+$((KEEP_IMAGES + 1))" | cut -d'|' -f2 | sort -u)"
+  [ -n "$old_ids" ] || return 0
+  echo "    pruning old $repo images beyond the newest $KEEP_IMAGES: $(echo "$old_ids" | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  docker rmi $old_ids >/dev/null 2>&1 || true  # a tag another running container still uses fails harmlessly
+}
+
+pull_extra_images() {  # pulls repo:latest for each --pull-extra pair, tags it to the bare local name the
+  # consuming service's own code actually references (e.g. judge's executionService.js spawns "sandbox-python",
+  # never an ECR path) - see docker-images/build-all.sh's local tag names for the mapping this must match.
+  [ -n "$PULL_EXTRA" ] || return 0
+  for pair in $PULL_EXTRA; do
+    local repo="${pair%%=*}" localtag="${pair#*=}"
+    echo "    pulling $REGISTRY/$repo:latest -> $localtag"
+    if docker pull "$REGISTRY/$repo:latest" >/dev/null; then
+      docker tag "$REGISTRY/$repo:latest" "$localtag"
+    else
+      echo "    !! failed to pull $repo (non-fatal: $localtag keeps whatever was already local, if anything)" >&2
+    fi
+  done
+}
+
 echo "==> [$ENV_NAME] deploying $SERVICE -> $TAG_VAR=$TAG"
 printf '%s' "$ECR_PASSWORD" | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
 unset ECR_PASSWORD
@@ -107,6 +152,8 @@ compose up -d --no-deps "$SERVICE"
 if wait_healthy; then
   echo "==> $SERVICE is healthy on $TAG"
   printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$ENV_NAME" "$SERVICE" "$TAG" >> .deploy-history
+  pull_extra_images
+  prune_old_tagged_images
   docker image prune -f --filter "until=168h" >/dev/null || true
   compose ps "$SERVICE"
   exit 0
