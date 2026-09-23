@@ -1,0 +1,145 @@
+name: Environment sync (reusable)
+
+# Applies an environment's configuration to its server:
+#   1. secrets/config from AWS SSM Parameter Store (/zepruv/<env>/*)  -> .env (mode 600), through the GitHub OIDC role
+#   2. compose / nginx / livekit files from the calling repo (zepruv-deploy) -> server
+#   3. validate with `docker compose config`, apply, wait for health, roll back on failure
+# The server never holds AWS credentials, and secrets travel only over the SSH session (stdin), never argv or logs.
+# Called from zepruv-deploy. Service repos only deploy images (deploy.yml) and never touch .env.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "staging | prod"
+        type: string
+        required: true
+      services:
+        description: "compose services to (re)start after the sync"
+        type: string
+        default: "rabbitmq redis livekit livekit-egress nginx datadog-agent"
+      files:
+        description: "files under environments/<env>/ copied to the server"
+        type: string
+        default: "docker-compose.yml livekit.yaml nginx.conf"
+      ssm_root:
+        type: string
+        default: "/zepruv"
+      min_keys:
+        description: "refuse to write fewer variables than this (guards against a wrong SSM path)"
+        type: number
+        default: 5
+      dry_run:
+        description: "only list the SSM variable NAMES that would be written (no server access)"
+        type: boolean
+        default: false
+      aws_region:
+        type: string
+        default: "ap-south-2"
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      SSH_PRIVATE_KEY:
+        required: false
+      SSH_KNOWN_HOSTS:
+        required: false
+      SSH_HOST:
+        required: false
+      SSH_USER:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: infra-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate inputs
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICES: ${{ inputs.services }}
+          FILES: ${{ inputs.files }}
+        run: |
+          set -euo pipefail
+          [[ "$ENV_NAME" =~ ^(staging|prod)$ ]] || { echo "::error::environment must be staging or prod"; exit 1; }
+          [[ "$SERVICES" =~ ^[a-z0-9\ -]+$ ]] || { echo "::error::invalid services"; exit 1; }
+          [[ "$FILES" =~ ^[A-Za-z0-9._\ -]+$ ]] || { echo "::error::invalid files"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+
+      - name: Read parameters from SSM
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SSM_ROOT: ${{ inputs.ssm_root }}
+          MIN_KEYS: ${{ inputs.min_keys }}
+          REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          umask 077
+          path="${SSM_ROOT}/${ENV_NAME}/"
+          aws ssm get-parameters-by-path --path "$path" --with-decryption --region "$REGION" --output json > "$RUNNER_TEMP/ssm.json"
+          python3 .ci/scripts/ssm_to_env.py --path "$path" --min-keys "$MIN_KEYS" < "$RUNNER_TEMP/ssm.json" > "$RUNNER_TEMP/env.lines"
+          rm -f "$RUNNER_TEMP/ssm.json"
+          echo "Variables that will be written (names only):"
+          cut -d= -f1 "$RUNNER_TEMP/env.lines" | sed 's/^/  - /'
+
+      - name: Copy configuration files and apply
+        if: ${{ !inputs.dry_run }}
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICES: ${{ inputs.services }}
+          FILES: ${{ inputs.files }}
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+          [ -n "$SSH_KEY" ] && [ -n "$KNOWN_HOSTS" ] && [ -n "$HOST" ] || { echo "::error::SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS and SSH_HOST secrets are required"; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/deploy_key"; chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          ssh_run() {
+            ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 "${SSH_USER:-ubuntu}@${HOST}" "$@"
+          }
+          DIR="/opt/zepruv/deploy/environments/${ENV_NAME}"
+
+          # shellcheck disable=SC2086
+          for f in $FILES; do [ -f "environments/${ENV_NAME}/$f" ] || { echo "::error::environments/${ENV_NAME}/$f is missing in this repo"; exit 1; }; done
+          # shellcheck disable=SC2086
+          tar -C "environments/${ENV_NAME}" -cf - $FILES | ssh_run "rm -rf '${DIR}/.incoming' && install -d -m 700 '${DIR}/.incoming' && tar -xf - -C '${DIR}/.incoming' --no-same-owner"
+
+          B64="$(base64 -w0 < .ci/scripts/infra-apply.sh)"
+          printf -v REMOTE_ARGS '%q ' --env "$ENV_NAME" --services "$SERVICES"
+          ssh_run "bash -c \"\$(printf %s '${B64}' | base64 -d)\" infra-apply ${REMOTE_ARGS}" < "$RUNNER_TEMP/env.lines"
+
+      - name: Clean up
+        if: always()
+        run: rm -f "$HOME/.ssh/deploy_key" "$RUNNER_TEMP/env.lines" "$RUNNER_TEMP/ssm.json"

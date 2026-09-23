@@ -1,0 +1,190 @@
+name: "Reusable: Python service CI"
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+      working_directory:
+        description: "Repo folder used for scans and as the docker build context"
+        type: string
+        default: "."
+      test_directory:
+        description: "Folder that holds requirements + tests when they are not at working_directory (e.g. the agent keeps them in agent/). Empty = working_directory"
+        type: string
+        default: ""
+      python_version:
+        type: string
+        default: "3.12"
+      requirements:
+        description: "Space-separated requirement files to install"
+        type: string
+        default: "requirements.txt"
+      run_tests:
+        description: "Run pytest with a coverage floor. Set false only while a service has no runnable tests (technical debt): dependencies are then not installed and only ruff runs."
+        type: boolean
+        default: true
+      pytest_args:
+        description: "Extra pytest args, e.g. --deselect tests/test_x.py::TestY::test_z (document why in the caller)"
+        type: string
+        default: ""
+      coverage_source:
+        type: string
+        default: "app"
+      coverage_min:
+        type: number
+        default: 30
+      ruff_select:
+        description: "Ruff rules that fail the build (real bugs: undefined names, redefinitions, syntax errors)"
+        type: string
+        default: "F821,F811,F823,E9"
+      docker_scan:
+        type: boolean
+        default: true
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      dd_site:
+        type: string
+        default: "us5.datadoghq.com"
+    secrets:
+      DD_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-python-${{ inputs.service_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security
+    uses: zepruv/.github/.github/workflows/security.yml@main
+    with:
+      language: python
+      working_directory: ${{ inputs.working_directory }}
+
+  logging-standard:
+    name: Logging standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+      - name: Check added lines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_REF: ${{ github.sha }}
+        run: python3 .ci/scripts/check_logging_standard.py --profile python --base "$BASE" --head "$HEAD_REF"
+
+  test:
+    name: Lint, tests and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.test_directory != '' && inputs.test_directory || inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.test_directory != '' && inputs.test_directory || inputs.working_directory }}/requirements*.txt
+
+      - name: Install
+        env:
+          REQUIREMENTS: ${{ inputs.requirements }}
+          RUN_TESTS: ${{ inputs.run_tests }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ "$RUN_TESTS" = "true" ]; then
+            for f in $REQUIREMENTS; do pip install -r "$f"; done
+            pip install pytest pytest-cov
+          fi
+          pip install "ruff==0.16.8"
+
+      - name: Lint for real bugs (ruff)
+        env:
+          SELECT: ${{ inputs.ruff_select }}
+        run: ruff check --select "$SELECT" --output-format github .
+
+      - name: Tests with coverage
+        if: ${{ inputs.run_tests }}
+        env:
+          SRC: ${{ inputs.coverage_source }}
+          PYTEST_EXTRA: ${{ inputs.pytest_args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          python -m pytest -q --cov="$SRC" --cov-report=xml --cov-report=term --junitxml=junit.xml $PYTEST_EXTRA
+
+      - name: Coverage gate
+        if: ${{ inputs.run_tests }}
+        env:
+          MIN: ${{ inputs.coverage_min }}
+          SERVICE: ${{ inputs.service_name }}
+        run: python3 "$GITHUB_WORKSPACE/.ci/scripts/check_coverage.py" --format cobertura --file coverage.xml --min "$MIN" --label "$SERVICE"
+
+      - name: Upload reports
+        if: ${{ always() && inputs.run_tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.service_name }}-reports
+          path: |
+            ${{ inputs.test_directory != '' && inputs.test_directory || inputs.working_directory }}/junit.xml
+            ${{ inputs.test_directory != '' && inputs.test_directory || inputs.working_directory }}/coverage.xml
+          retention-days: 7
+
+      - name: Datadog Test Visibility (optional)
+        if: ${{ always() && inputs.run_tests && env.DD_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          DD_SITE: ${{ inputs.dd_site }}
+          SERVICE: ${{ inputs.service_name }}
+        run: npx --yes @datadog/datadog-ci@5.24.1 junit upload --service "$SERVICE" --env ci junit.xml
+
+  docker:
+    name: Docker image scan
+    if: ${{ inputs.docker_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          CONTEXT: ${{ inputs.working_directory }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --pull -t "ci/${{ inputs.service_name }}:${{ github.sha }}" -f "$CONTEXT/$DOCKERFILE" "$CONTEXT"
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ci/${{ inputs.service_name }}:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table

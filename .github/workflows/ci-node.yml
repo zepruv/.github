@@ -1,0 +1,158 @@
+name: "Reusable: Node service / frontend CI"
+
+# Node services (judge, signalling) and Vite frontends. Tests/coverage are optional per project because the frontends
+# do not have a test suite yet; set test_command to enable the coverage floor.
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+      kind:
+        description: "service (Node backend, console.* forbidden) | frontend (browser code)"
+        type: string
+        default: service
+      working_directory:
+        type: string
+        default: "."
+      node_version:
+        type: string
+        default: "22"
+      install_command:
+        type: string
+        default: "npm ci"
+      lint_command:
+        description: "Empty to skip"
+        type: string
+        default: ""
+      build_command:
+        description: "Empty to skip"
+        type: string
+        default: ""
+      test_command:
+        description: "Must write coverage/lcov.info (e.g. npx c8@12.0.0 --reporter=lcov node --test tests/*.test.js). Empty to skip."
+        type: string
+        default: ""
+      coverage_min:
+        type: number
+        default: 30
+      docker_scan:
+        type: boolean
+        default: false
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-node-${{ inputs.service_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security
+    uses: zepruv/.github/.github/workflows/security.yml@main
+    with:
+      language: ${{ inputs.kind == 'frontend' && 'frontend' || 'node' }}
+      working_directory: ${{ inputs.working_directory }}
+
+  logging-standard:
+    name: Logging standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+      - name: Check added lines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_REF: ${{ github.sha }}
+          PROFILE: ${{ inputs.kind == 'frontend' && 'frontend' || 'node' }}
+        run: python3 .ci/scripts/check_logging_standard.py --profile "$PROFILE" --base "$BASE" --head "$HEAD_REF"
+
+  test:
+    name: Lint, build, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Install
+        env:
+          CMD: ${{ inputs.install_command }}
+        run: bash -c "$CMD"
+
+      - name: Lint
+        if: ${{ inputs.lint_command != '' }}
+        env:
+          CMD: ${{ inputs.lint_command }}
+        run: bash -c "$CMD"
+
+      - name: Build
+        if: ${{ inputs.build_command != '' }}
+        env:
+          CMD: ${{ inputs.build_command }}
+        run: bash -c "$CMD"
+
+      - name: Tests with coverage
+        if: ${{ inputs.test_command != '' }}
+        env:
+          CMD: ${{ inputs.test_command }}
+        run: bash -c "$CMD"
+
+      - name: Coverage gate
+        if: ${{ inputs.test_command != '' }}
+        env:
+          MIN: ${{ inputs.coverage_min }}
+          SERVICE: ${{ inputs.service_name }}
+        run: python3 "$GITHUB_WORKSPACE/.ci/scripts/check_coverage.py" --format lcov --file coverage/lcov.info --min "$MIN" --label "$SERVICE"
+
+  docker:
+    name: Docker image scan
+    if: ${{ inputs.docker_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          CONTEXT: ${{ inputs.working_directory }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --pull -t "ci/${{ inputs.service_name }}:${{ github.sha }}" -f "$CONTEXT/$DOCKERFILE" "$CONTEXT"
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ci/${{ inputs.service_name }}:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table

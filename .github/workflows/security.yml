@@ -1,0 +1,143 @@
+name: "Reusable: security gate"
+
+# Secrets (gitleaks), dependency/IaC vulnerabilities (Trivy) and code patterns (Semgrep).
+# Free tools only. Findings on OLD code never block a PR:
+#   - gitleaks scans the commits of the PR/push (full history only when full_history=true, e.g. a nightly job)
+#   - Semgrep reports only findings that are NEW relative to the base commit
+# Accept a known finding deliberately: .gitleaksignore (fingerprint), .trivyignore (CVE id + reason + expiry date).
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Semgrep ruleset: java | python | node | frontend"
+        type: string
+        default: node
+      working_directory:
+        description: "Directory Trivy scans (repo-relative)"
+        type: string
+        default: "."
+      full_history:
+        description: "Scan the whole git history with gitleaks (nightly / audit), not just the change"
+        type: boolean
+        default: false
+      trivy_severity:
+        type: string
+        default: "CRITICAL,HIGH"
+      trivy_skip_dirs:
+        type: string
+        default: "node_modules,target,venv,.venv,dist,build"
+      semgrep:
+        description: "Run Semgrep (new findings only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          VERSION=8.24.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" -o gitleaks.tgz
+          echo "cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          FULL_HISTORY: ${{ inputs.full_history }}
+        run: |
+          set -euo pipefail
+          args=(detect --redact --no-banner --verbose)
+          if [ "$FULL_HISTORY" = "true" ]; then
+            echo "Scanning the full history"
+          elif [ "$EVENT" = "pull_request" ]; then
+            args+=("--log-opts=${BASE_SHA}..${HEAD_SHA}")
+          elif [ -n "${BEFORE_SHA//0/}" ]; then
+            args+=("--log-opts=${BEFORE_SHA}..${GITHUB_SHA}")
+          else
+            args+=("--log-opts=-1")   # first push of a branch: just the tip commit
+          fi
+          gitleaks "${args[@]}"
+
+  trivy:
+    name: Vulnerabilities and misconfiguration (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.working_directory }}
+          scanners: vuln,secret,misconfig
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+          skip-dirs: ${{ inputs.trivy_skip_dirs }}
+          exit-code: "1"
+          format: table
+
+  semgrep:
+    name: Code patterns (Semgrep, new findings only)
+    if: ${{ inputs.semgrep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install --no-cache-dir "semgrep==1.177.0"
+
+      - name: Scan
+        env:
+          LANGUAGE: ${{ inputs.language }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          packs=(p/owasp-top-ten p/secrets p/dockerfile)
+          case "$LANGUAGE" in
+            java)     packs+=(p/java) ;;
+            python)   packs+=(p/python) ;;
+            node)     packs+=(p/nodejs p/javascript) ;;
+            frontend) packs+=(p/javascript p/typescript p/react) ;;
+            *) echo "unknown language: $LANGUAGE"; exit 2 ;;
+          esac
+          args=(scan --error --severity ERROR --metrics off --disable-version-check)
+          for p in "${packs[@]}"; do args+=(--config "$p"); done
+          if [ "$EVENT" = "pull_request" ]; then
+            args+=(--baseline-commit "$BASE_SHA")
+          elif [ -n "${BEFORE_SHA//0/}" ]; then
+            args+=(--baseline-commit "$BEFORE_SHA")
+          else
+            args+=(--baseline-commit "HEAD~1")
+          fi
+          semgrep "${args[@]}"

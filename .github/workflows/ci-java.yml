@@ -1,0 +1,163 @@
+name: "Reusable: Java (Maven) service CI"
+
+# Pull-request / pre-deploy gate for Spring Boot services:
+#   security (secrets, CVEs, Semgrep) + logging standard + tests with a coverage floor + Docker image scan.
+# Called from each service repo (pr.yml) and again by deploy.yml, so an unchecked commit can never deploy.
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+      working_directory:
+        type: string
+        default: "."
+      java_version:
+        type: string
+        default: "21"
+      coverage_min:
+        description: "Minimum LINE coverage percent (JaCoCo). Ratchet it up as tests are added; never lower it."
+        type: number
+        default: 25
+      maven_args:
+        type: string
+        default: ""
+      test_excludes:
+        description: "Surefire -Dtest expression, e.g. '!SlowStressTest,!KnownBrokenTest' (document why in the caller)"
+        type: string
+        default: ""
+      docker_scan:
+        description: "Build the Dockerfile and Trivy-scan the image"
+        type: boolean
+        default: true
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      dd_site:
+        type: string
+        default: "us5.datadoghq.com"
+    secrets:
+      DD_API_KEY:
+        description: "Optional: uploads JUnit results to Datadog Test Visibility (no effect when unset)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-java-${{ inputs.service_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security
+    uses: zepruv/.github/.github/workflows/security.yml@main
+    with:
+      language: java
+      working_directory: ${{ inputs.working_directory }}
+
+  logging-standard:
+    name: Logging standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+      - name: Check added lines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_REF: ${{ github.sha }}
+        run: python3 .ci/scripts/check_logging_standard.py --profile java --base "$BASE" --head "$HEAD_REF"
+
+  test:
+    name: Tests and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Test with JaCoCo
+        env:
+          MAVEN_ARGS_EXTRA: ${{ inputs.maven_args }}
+          TEST_EXCLUDES: ${{ inputs.test_excludes }}
+        run: |
+          set -euo pipefail
+          MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw
+          args=(-B -ntp clean test)
+          if [ -n "$TEST_EXCLUDES" ]; then args+=("-Dtest=$TEST_EXCLUDES" -Dsurefire.failIfNoSpecifiedTests=false); fi
+          # shellcheck disable=SC2086
+          $MVN "${args[@]}" $MAVEN_ARGS_EXTRA
+
+      - name: Coverage gate
+        env:
+          MIN: ${{ inputs.coverage_min }}
+          SERVICE: ${{ inputs.service_name }}
+        run: python3 "$GITHUB_WORKSPACE/.ci/scripts/check_coverage.py" --format jacoco --file target/site/jacoco/jacoco.xml --min "$MIN" --label "$SERVICE"
+
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.service_name }}-reports
+          path: |
+            ${{ inputs.working_directory }}/target/surefire-reports
+            ${{ inputs.working_directory }}/target/site/jacoco
+          retention-days: 7
+
+      - name: Datadog Test Visibility (optional)
+        if: ${{ always() && env.DD_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          DD_SITE: ${{ inputs.dd_site }}
+          SERVICE: ${{ inputs.service_name }}
+        run: npx --yes @datadog/datadog-ci@5.24.1 junit upload --service "$SERVICE" --env ci target/surefire-reports
+
+  docker:
+    name: Docker image scan
+    if: ${{ inputs.docker_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          CONTEXT: ${{ inputs.working_directory }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --pull -t "ci/${{ inputs.service_name }}:${{ github.sha }}" -f "$CONTEXT/$DOCKERFILE" "$CONTEXT"
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ci/${{ inputs.service_name }}:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
