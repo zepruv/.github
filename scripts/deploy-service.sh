@@ -111,19 +111,26 @@ prune_old_tagged_images() {  # keeps the newest $KEEP_IMAGES *tagged* local imag
   # rmi the rest. $KEEP_IMAGES >= 2 always leaves the just-deployed tag and the previous one the rollback path
   # in this script might still need.
   [ -n "$ECR_REPOSITORY" ] || return 0
-  local repo="$REGISTRY/$ECR_REPOSITORY" old_refs ref
+  local repo="$REGISTRY/$ECR_REPOSITORY"
   # Remove by repo:tag, never by image ID: several tags routinely point at ONE image (a redeploy of unchanged code
   # gets a new sha- tag but the same image), and `docker rmi <id>` refuses to delete an image that has more than
   # one tag ("referenced in multiple repositories") - which the || true below would hide, so nothing was ever pruned.
   # `docker rmi repo:tag` just drops that tag, and the image itself once its last tag goes.
-  old_refs="$(docker images "$repo" --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' | grep -v ':<none>$' \
-    | sort -r | tail -n "+$((KEEP_IMAGES + 1))" | cut -d'|' -f2)"
-  for ref in $old_refs; do
-    # never drop the tag just deployed or the one a rollback would need, even if timestamps tie
-    if [ "$ref" = "$repo:$TAG" ] || { [ -n "$PREVIOUS_TAG" ] && [ "$ref" = "$repo:$PREVIOUS_TAG" ]; }; then continue; fi
+  # Protected tags (just deployed + the rollback target) always stay and count toward $KEEP_IMAGES; the remaining
+  # slots go to the newest other tags, everything past that is removed. Doing it in this order matters: tags of an
+  # unchanged image all share one creation time, so trimming first and skipping protected tags afterwards can leave
+  # the "extra" tag being the protected one, and then nothing gets pruned at all.
+  local slots=$((KEEP_IMAGES - 1)) seen=0 ref
+  [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$TAG" ] && slots=$((slots - 1))
+  [ "$slots" -lt 0 ] && slots=0
+  while IFS= read -r ref; do
+    [ "$ref" = "$repo:$TAG" ] && continue
+    [ -n "$PREVIOUS_TAG" ] && [ "$ref" = "$repo:$PREVIOUS_TAG" ] && continue
+    seen=$((seen + 1))
+    [ "$seen" -le "$slots" ] && continue
     echo "    pruning old image tag $ref"
     docker rmi "$ref" >/dev/null 2>&1 || true  # a tag another running container still uses fails harmlessly
-  done
+  done < <(docker images "$repo" --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' | grep -v ':<none>$' | sort -r | cut -d'|' -f2)
 }
 
 pull_extra_images() {  # pulls repo:latest for each --pull-extra pair, tags it to the bare local name the
