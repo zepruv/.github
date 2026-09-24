@@ -6,8 +6,14 @@ name: "Reusable: build and deploy a frontend to Cloudflare Workers (static asset
 # (`<name>-<environment>`), created on first deploy with no dashboard step. Each block owns everything that differs:
 #   - "routes": [{ "pattern": "staging.example.com", "custom_domain": true }]   Cloudflare creates the DNS record + certificate
 #   - "vars":   { "API_BACKEND_URL": "https://staging-api.example.com" }        runtime settings of the /api proxy
-# Build-time VITE_* values come from Vite's per-mode files (.env.<mode>, committed, public values only) and the caller
-# passes `--mode <mode>` in build_command - so a build only ever contains its own environment's values.
+# Build-time VITE_* values are passed per environment in `build_env` (the caller fills them from GitHub repository
+# Variables such as STAGING_API_URL, so no env file is ever committed) and the caller passes `--mode <mode>` in
+# build_command - so a build only ever contains its own environment's values.
+#
+# Everything in a VITE_* value is PUBLIC once it is in the bundle. Mistakes are guarded, not trusted away: build_env only
+# accepts VITE_* names and refuses names containing SECRET / PASSWORD / PASSWD / PRIVATE / CREDENTIAL, and the finished
+# bundle is scanned with gitleaks before anything is uploaded (a `.gitleaks.toml` in the project root is honoured, e.g. to
+# allow a public-by-design tracking key).
 #
 # There is no branch alias or CNAME to drift: a hostname is bound to one specific Worker by the deploy itself. Every deploy
 # still ships /version.txt and, when `health_url` is set, the run fails unless that URL serves THIS commit, which also
@@ -26,6 +32,10 @@ on:
         description: "Build command; pass the Vite mode here, e.g. 'npm run build -- --mode staging'"
         type: string
         default: "npm run build"
+      build_env:
+        description: "Newline-separated VITE_KEY=value lines exported to the build. Only VITE_* names; names that look like secrets are refused."
+        type: string
+        default: ""
       health_url:
         description: "Public URL of this environment (e.g. https://staging.zepruv.me/). After deploy it must serve this commit's /version.txt."
         type: string
@@ -99,6 +109,28 @@ jobs:
           cache: npm
           cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
 
+      - name: Export build variables (VITE_* only)
+        env:
+          BUILD_ENV: ${{ inputs.build_env }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+            if [[ ! "$line" =~ ^[[:space:]]*(VITE_[A-Z0-9_]+)=(.*)$ ]]; then
+              echo "::error::build_env accepts only VITE_KEY=value lines (offending name: ${line%%=*})"; exit 1
+            fi
+            name="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+            if [[ "$name" =~ (SECRET|PASSWORD|PASSWD|PRIVATE|CREDENTIAL) ]]; then
+              echo "::error::$name looks like a secret. VITE_* values are baked into the public bundle - a secret must never be one."; exit 1
+            fi
+            if [ -z "$value" ]; then
+              echo "::notice::$name is empty (repository variable not set?) - not exported"; continue
+            fi
+            echo "$name=$value" >> "$GITHUB_ENV"
+            echo "build var: $name"
+          done <<< "$BUILD_ENV"
+
       - name: Install
         run: npm ci
 
@@ -121,6 +153,20 @@ jobs:
           # never cached, or the post-deploy check could read a stale marker
           printf '\n/version.txt\n  Cache-Control: no-store\n' >> "$OUTPUT_DIR/_headers"
           echo "output: $(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ') files, $(du -sh "$OUTPUT_DIR" | cut -f1); version marker ${BUILT_SHA::12} ($DEPLOY_ENV)"
+
+      - name: Scan the bundle for secrets (gitleaks)
+        env:
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          set -euo pipefail
+          VERSION=8.24.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" -o "$RUNNER_TEMP/gitleaks.tgz"
+          echo "cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          args=(detect --no-git --source "$OUTPUT_DIR" --redact --no-banner)
+          [ -f .gitleaks.toml ] && args+=(--config "$PWD/.gitleaks.toml")
+          # runs on what will actually be published, so it catches a secret whatever way it got into the build
+          "$RUNNER_TEMP/gitleaks" "${args[@]}"
 
       - name: Deploy to Cloudflare
         env:
