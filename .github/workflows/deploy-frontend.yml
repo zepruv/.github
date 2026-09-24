@@ -1,65 +1,44 @@
-name: "Reusable: build and deploy a frontend to Cloudflare Pages"
+name: "Reusable: build and deploy a frontend to Cloudflare Workers (static assets)"
 
-# Builds a Vite app and uploads it to ONE Cloudflare Pages project per repo (wrangler Direct Upload), behind the
-# caller's CI gates. Every environment is a branch of that project:
+# Builds a Vite app and deploys it with `wrangler deploy --env <environment>`, behind the caller's CI gates.
 #
-#   branch == production_branch (main)  -> the project's PRODUCTION deployment (custom domain attached in Cloudflare)
-#   any other branch (staging, test...) -> a PREVIEW deployment, always reachable at <branch>.<project>.pages.dev
+# The repo has ONE wrangler.jsonc; every environment is a block under "env" and becomes its own Worker
+# (`<name>-<environment>`), created on first deploy with no dashboard step. Each block owns everything that differs:
+#   - "routes": [{ "pattern": "staging.example.com", "custom_domain": true }]   Cloudflare creates the DNS record + certificate
+#   - "vars":   { "API_BACKEND_URL": "https://staging-api.example.com" }        runtime settings of the /api proxy
+# Build-time VITE_* values come from Vite's per-mode files (.env.<mode>, committed, public values only) and the caller
+# passes `--mode <mode>` in build_command - so a build only ever contains its own environment's values.
 #
-# Cloudflare attaches a custom domain only to production, so a non-production environment gets its domain with a
-# PROXIED DNS CNAME to its alias (`staging.zepruv.me -> staging.<project>.pages.dev`, orange cloud). If that record is
-# later edited or un-proxied, Cloudflare does not error - it serves PRODUCTION on the staging hostname. Every deploy
-# therefore ships /version.txt and, when `health_url` is set, the run fails unless that URL serves THIS commit.
+# There is no branch alias or CNAME to drift: a hostname is bound to one specific Worker by the deploy itself. Every deploy
+# still ships /version.txt and, when `health_url` is set, the run fails unless that URL serves THIS commit, which also
+# catches a domain that was never attached or a stale deployment.
 #
-# A Pages project only has two variable sets (Production / Preview), which is not enough for staging + test + prod, so
-# nothing environment-specific lives in the Cloudflare dashboard:
-#   - VITE_* build values are passed per environment in `build_env` (public once baked into the bundle)
-#   - the /api proxy target is baked into the deployment with `api_backend_url` (see functions/_lib/backend.js)
-#
-# Adding an environment = another caller job (own branch, build_env, api_backend_url, health_url) + its proxied CNAME.
+# Never run `wrangler deploy` without --env: the shared top level carries no domain or vars.
 
 on:
   workflow_call:
     inputs:
-      project_name:
-        description: "The repo's single Cloudflare Pages project, e.g. zepruv-frontend"
-        type: string
-        required: true
       environment:
-        description: "prod | staging | test | ... (labels the run and the version marker)"
+        description: "Name of the env block in wrangler.jsonc: staging | test | production | ..."
         type: string
         required: true
-      branch:
-        description: "Cloudflare branch for this environment. prod must be production_branch; every other environment must not be."
+      build_command:
+        description: "Build command; pass the Vite mode here, e.g. 'npm run build -- --mode staging'"
         type: string
-        required: true
-      production_branch:
-        description: "The project's production branch (set when the project was created)"
-        type: string
-        default: "main"
-      build_env:
-        description: "Newline-separated VITE_KEY=value lines exported to the build. Only VITE_* names are accepted."
-        type: string
-        default: ""
-      api_backend_url:
-        description: "Origin the Pages Function proxies /api/* to (https only), baked into this deployment, e.g. https://staging-api.zepruv.me"
-        type: string
-        default: ""
+        default: "npm run build"
       health_url:
         description: "Public URL of this environment (e.g. https://staging.zepruv.me/). After deploy it must serve this commit's /version.txt."
         type: string
         default: ""
       working_directory:
+        description: "Folder that holds package.json and wrangler.jsonc"
         type: string
         default: "."
       node_version:
         type: string
         default: "22"
-      build_command:
-        type: string
-        default: "npm run build"
       output_dir:
-        description: "Build output directory, relative to working_directory"
+        description: "Build output directory, relative to working_directory (must match assets.directory in wrangler.jsonc)"
         type: string
         default: "dist"
       ref:
@@ -68,7 +47,7 @@ on:
         default: ""
     secrets:
       CLOUDFLARE_API_TOKEN:
-        description: "API token with Account > Cloudflare Pages > Edit"
+        description: "API token: the 'Edit Cloudflare Workers' template, scoped to the account and the zone that owns the domains"
         required: true
       CLOUDFLARE_ACCOUNT_ID:
         required: true
@@ -76,13 +55,14 @@ on:
 permissions:
   contents: read
 
-# One deploy at a time per Pages project; a newer push waits instead of racing the running upload.
+# One deploy at a time per repo + environment; a newer push waits instead of racing the running upload.
 concurrency:
-  group: deploy-frontend-${{ inputs.project_name }}
+  group: deploy-frontend-${{ github.repository }}-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
   WRANGLER_VERSION: "4.138.0"
+  WRANGLER_SEND_METRICS: "false"
 
 jobs:
   deploy:
@@ -93,24 +73,17 @@ jobs:
       run:
         working-directory: ${{ inputs.working_directory }}
     steps:
-      - name: Check the environment / branch pairing
+      - name: Check the environment
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
-          BRANCH: ${{ inputs.branch }}
-          PROD_BRANCH: ${{ inputs.production_branch }}
-          PROJECT: ${{ inputs.project_name }}
+          CALLER_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9-]{0,57}$ ]] || { echo "::error::project_name must be lowercase letters, digits and hyphens"; exit 1; }
-          # The branch becomes a DNS label (<branch>.<project>.pages.dev): keep it predictable.
-          [[ "$BRANCH" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "::error::branch '$BRANCH' must be lowercase letters, digits and hyphens (it becomes a DNS name)"; exit 1; }
-          if [ "$DEPLOY_ENV" = prod ] && [ "$BRANCH" != "$PROD_BRANCH" ]; then
-            echo "::error::prod must deploy branch '$PROD_BRANCH' (got '$BRANCH'): anything else becomes a preview and the prod domain would not change"; exit 1
+          [[ "$DEPLOY_ENV" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "::error::environment must be lowercase letters, digits and hyphens (got '$DEPLOY_ENV')"; exit 1; }
+          if [ "$DEPLOY_ENV" = production ] && [ "$CALLER_REF" != refs/heads/main ]; then
+            echo "::error::production deploys only run from main (this run is on $CALLER_REF)"; exit 1
           fi
-          if [ "$DEPLOY_ENV" != prod ] && [ "$BRANCH" = "$PROD_BRANCH" ]; then
-            echo "::error::'$DEPLOY_ENV' with branch '$BRANCH' would deploy to PRODUCTION - give this environment its own branch name"; exit 1
-          fi
-          echo "ok: $DEPLOY_ENV -> branch '$BRANCH' ($([ "$BRANCH" = "$PROD_BRANCH" ] && echo production || echo "preview at $BRANCH.$PROJECT.pages.dev"))"
+          echo "ok: deploying environment '$DEPLOY_ENV' from $CALLER_REF"
 
       - uses: actions/checkout@v4
         with:
@@ -126,46 +99,16 @@ jobs:
           cache: npm
           cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
 
-      - name: Export build variables (VITE_* only)
-        env:
-          BUILD_ENV: ${{ inputs.build_env }}
-          DEPLOY_ENV: ${{ inputs.environment }}
-        run: |
-          set -euo pipefail
-          # defaults first, so the caller can override them
-          echo "VITE_APP_VERSION=${BUILT_SHA::12}" >> "$GITHUB_ENV"
-          echo "VITE_DD_ENV=${DEPLOY_ENV}" >> "$GITHUB_ENV"
-          while IFS= read -r line || [ -n "$line" ]; do
-            line="${line%$'\r'}"
-            [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
-            if [[ "$line" =~ ^[[:space:]]*(VITE_[A-Z0-9_]+)=(.*)$ ]]; then
-              echo "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
-              echo "build var: ${BASH_REMATCH[1]}"
-            else
-              echo "::error::build_env accepts only VITE_KEY=value lines (offending name: ${line%%=*})"
-              exit 1
-            fi
-          done <<< "$BUILD_ENV"
-
-      - name: Set the /api proxy target for this deployment
-        if: ${{ inputs.api_backend_url != '' }}
-        env:
-          API_BACKEND_URL: ${{ inputs.api_backend_url }}
-        run: |
-          set -euo pipefail
-          [[ "$API_BACKEND_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || { echo "::error::api_backend_url must be an https origin with no path (got: $API_BACKEND_URL)"; exit 1; }
-          [ -d functions ] || { echo "::error::api_backend_url was given but there is no ./functions directory to configure"; exit 1; }
-          mkdir -p functions/_lib
-          printf 'export const API_BACKEND_URL = "%s";\n' "$API_BACKEND_URL" > functions/_lib/backend.js
-          echo "proxy target for this deployment: $API_BACKEND_URL"
-
       - name: Install
         run: npm ci
 
       - name: Build
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
-        run: bash -c "$BUILD_COMMAND"
+        run: |
+          set -euo pipefail
+          export VITE_APP_VERSION="${BUILT_SHA::12}"   # the app can show which build it is; a .env.<mode> file can not override the commit
+          bash -c "$BUILD_COMMAND"
 
       - name: Check the build output and add the version marker
         env:
@@ -178,25 +121,19 @@ jobs:
           # never cached, or the post-deploy check could read a stale marker
           printf '\n/version.txt\n  Cache-Control: no-store\n' >> "$OUTPUT_DIR/_headers"
           echo "output: $(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ') files, $(du -sh "$OUTPUT_DIR" | cut -f1); version marker ${BUILT_SHA::12} ($DEPLOY_ENV)"
-          if [ -d functions ]; then echo "Pages Functions: $(find functions -type f | tr '\n' ' ')"; fi
 
-      - name: Deploy to Cloudflare Pages
+      - name: Deploy to Cloudflare
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          PROJECT: ${{ inputs.project_name }}
-          BRANCH: ${{ inputs.branch }}
-          OUTPUT_DIR: ${{ inputs.output_dir }}
           DEPLOY_ENV: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          # Run from the project root so wrangler also picks up ./functions (the /api proxy) next to the static output.
-          npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy "$OUTPUT_DIR" \
-            --project-name "$PROJECT" --branch "$BRANCH" \
-            --commit-hash "$BUILT_SHA" --commit-message "${DEPLOY_ENV}: ${GITHUB_REPOSITORY}@${BUILT_SHA::12}" \
-            --commit-dirty=true | tee "$RUNNER_TEMP/wrangler.out"
-          url="$(grep -oE 'https://[a-zA-Z0-9.-]+\.pages\.dev' "$RUNNER_TEMP/wrangler.out" | tail -n1 || true)"
-          { echo "### Deployed \`${PROJECT}\` (${DEPLOY_ENV})"; echo "- commit: \`${BUILT_SHA::12}\`"; echo "- Cloudflare branch: \`${BRANCH}\`"; [ -n "$url" ] && echo "- deployment: ${url}"; } >> "$GITHUB_STEP_SUMMARY"
+          # wrangler refuses an --env that has no block in wrangler.jsonc, so a typo cannot deploy anything.
+          npx --yes "wrangler@${WRANGLER_VERSION}" deploy --env "$DEPLOY_ENV" \
+            --message "${DEPLOY_ENV}: ${GITHUB_REPOSITORY}@${BUILT_SHA::12}" | tee "$RUNNER_TEMP/wrangler.out"
+          version="$(grep -oE 'Current Version ID: [0-9a-f-]+' "$RUNNER_TEMP/wrangler.out" | tail -n1 || true)"
+          { echo "### Deployed \`${DEPLOY_ENV}\`"; echo "- commit: \`${BUILT_SHA::12}\`"; [ -n "$version" ] && echo "- ${version}"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify the environment URL serves this commit
         if: ${{ inputs.health_url != '' }}
@@ -212,5 +149,5 @@ jobs:
             [ "$got" = "$BUILT_SHA" ] && { echo "ok: $HEALTH_URL serves this commit"; exit 0; }
             sleep 10
           done
-          echo "::error::$HEALTH_URL does not serve this commit. Custom domain not attached / CNAME not pointing at the $DEPLOY_ENV alias, or it is un-proxied and serving production."
+          echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, and that no leftover DNS record blocks it."
           exit 1
