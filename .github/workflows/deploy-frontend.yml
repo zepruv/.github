@@ -1,0 +1,164 @@
+name: "Reusable: build and deploy a frontend to Cloudflare Pages"
+
+# Builds a Vite app and uploads it to a Cloudflare Pages project with wrangler (Direct Upload), so the deploy sits behind
+# the caller's CI gates instead of running on Cloudflare's own Git integration.
+#
+# One Pages project per ENVIRONMENT (e.g. zepruv-frontend-staging, zepruv-frontend), not one project with branch aliases:
+# Cloudflare only attaches custom domains to a project's PRODUCTION branch, so a project whose production branch is
+# `staging` is what lets staging.zepruv.me point at it directly (no CNAME-to-alias workaround).
+#
+# `branch` MUST equal that project's production branch (set at creation: `wrangler pages project create <name>
+# --production-branch=<branch>`). If it differs, the upload becomes a *preview* deployment and the custom domain keeps
+# serving the previous production one - the deploy looks green and nothing changes.
+#
+# VITE_* values are baked into the bundle at build time and are PUBLIC once shipped: pass only values that are safe in a
+# browser (URLs, flags, public client tokens), never secrets. That is why `build_env` only accepts VITE_* names.
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: "Cloudflare Pages project, e.g. zepruv-frontend-staging"
+        type: string
+        required: true
+      branch:
+        description: "Value for wrangler --branch; must equal the project's production branch to deploy to production"
+        type: string
+        required: true
+      environment:
+        description: "staging | prod (labels the run; also stamped into the deployment commit message)"
+        type: string
+        required: true
+      build_env:
+        description: "Newline-separated VITE_KEY=value lines exported to the build. Only VITE_* names are accepted."
+        type: string
+        default: ""
+      health_url:
+        description: "Optional public URL that must answer 200 after the deploy (e.g. https://staging.zepruv.me/)"
+        type: string
+        default: ""
+      working_directory:
+        type: string
+        default: "."
+      node_version:
+        type: string
+        default: "22"
+      build_command:
+        type: string
+        default: "npm run build"
+      output_dir:
+        description: "Build output directory, relative to working_directory"
+        type: string
+        default: "dist"
+      ref:
+        description: "Commit to build and deploy (empty = the triggering commit)"
+        type: string
+        default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: "API token with Account > Cloudflare Pages > Edit"
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+# One deploy at a time per Pages project; a newer push waits instead of racing the running upload.
+concurrency:
+  group: deploy-frontend-${{ inputs.project_name }}
+  cancel-in-progress: false
+
+env:
+  WRANGLER_VERSION: "4.138.0"
+
+jobs:
+  deploy:
+    name: Build and deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Export build variables (VITE_* only)
+        env:
+          BUILD_ENV: ${{ inputs.build_env }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          # defaults first, so the caller can override them
+          echo "VITE_APP_VERSION=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          echo "VITE_DD_ENV=${DEPLOY_ENV}" >> "$GITHUB_ENV"
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+            if [[ "$line" =~ ^[[:space:]]*(VITE_[A-Z0-9_]+)=(.*)$ ]]; then
+              echo "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+              echo "build var: ${BASH_REMATCH[1]}"
+            else
+              echo "::error::build_env accepts only VITE_KEY=value lines (offending name: ${line%%=*})"
+              exit 1
+            fi
+          done <<< "$BUILD_ENV"
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: bash -c "$BUILD_COMMAND"
+
+      - name: Check the build output
+        env:
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          set -euo pipefail
+          [ -f "$OUTPUT_DIR/index.html" ] || { echo "::error::$OUTPUT_DIR/index.html missing - the build produced no site"; exit 1; }
+          echo "output: $(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ') files, $(du -sh "$OUTPUT_DIR" | cut -f1)"
+          if [ -d functions ]; then echo "Pages Functions found: $(find functions -type f | tr '\n' ' ')"; fi
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PROJECT: ${{ inputs.project_name }}
+          BRANCH: ${{ inputs.branch }}
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          # Run from the repo root so wrangler also picks up ./functions (the /api proxy) next to the static output.
+          npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy "$OUTPUT_DIR" \
+            --project-name "$PROJECT" --branch "$BRANCH" \
+            --commit-hash "$GITHUB_SHA" --commit-message "${DEPLOY_ENV}: ${GITHUB_REPOSITORY}@${GITHUB_SHA::12}" \
+            --commit-dirty=true | tee "$RUNNER_TEMP/wrangler.out"
+          url="$(grep -oE 'https://[a-zA-Z0-9.-]+\.pages\.dev' "$RUNNER_TEMP/wrangler.out" | tail -n1 || true)"
+          { echo "### Deployed \`${PROJECT}\` (${DEPLOY_ENV})"; echo "- commit: \`${GITHUB_SHA::12}\`"; echo "- branch sent to Cloudflare: \`${BRANCH}\`"; [ -n "$url" ] && echo "- deployment: ${url}"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the public URL
+        if: ${{ inputs.health_url != '' }}
+        env:
+          HEALTH_URL: ${{ inputs.health_url }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)"
+            echo "attempt $i: $HEALTH_URL -> $code"
+            [ "$code" = 200 ] && exit 0
+            sleep 10
+          done
+          echo "::error::$HEALTH_URL did not answer 200 after the deploy (custom domain not attached to this project, or wrong production branch?)"
+          exit 1
