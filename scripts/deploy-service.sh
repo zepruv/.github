@@ -111,12 +111,19 @@ prune_old_tagged_images() {  # keeps the newest $KEEP_IMAGES *tagged* local imag
   # rmi the rest. $KEEP_IMAGES >= 2 always leaves the just-deployed tag and the previous one the rollback path
   # in this script might still need.
   [ -n "$ECR_REPOSITORY" ] || return 0
-  local repo="$REGISTRY/$ECR_REPOSITORY" old_ids
-  old_ids="$(docker images "$repo" --format '{{.CreatedAt}}|{{.ID}}' | sort -r | tail -n "+$((KEEP_IMAGES + 1))" | cut -d'|' -f2 | sort -u)"
-  [ -n "$old_ids" ] || return 0
-  echo "    pruning old $repo images beyond the newest $KEEP_IMAGES: $(echo "$old_ids" | tr '\n' ' ')"
-  # shellcheck disable=SC2086
-  docker rmi $old_ids >/dev/null 2>&1 || true  # a tag another running container still uses fails harmlessly
+  local repo="$REGISTRY/$ECR_REPOSITORY" old_refs ref
+  # Remove by repo:tag, never by image ID: several tags routinely point at ONE image (a redeploy of unchanged code
+  # gets a new sha- tag but the same image), and `docker rmi <id>` refuses to delete an image that has more than
+  # one tag ("referenced in multiple repositories") - which the || true below would hide, so nothing was ever pruned.
+  # `docker rmi repo:tag` just drops that tag, and the image itself once its last tag goes.
+  old_refs="$(docker images "$repo" --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' | grep -v ':<none>$' \
+    | sort -r | tail -n "+$((KEEP_IMAGES + 1))" | cut -d'|' -f2)"
+  for ref in $old_refs; do
+    # never drop the tag just deployed or the one a rollback would need, even if timestamps tie
+    if [ "$ref" = "$repo:$TAG" ] || { [ -n "$PREVIOUS_TAG" ] && [ "$ref" = "$repo:$PREVIOUS_TAG" ]; }; then continue; fi
+    echo "    pruning old image tag $ref"
+    docker rmi "$ref" >/dev/null 2>&1 || true  # a tag another running container still uses fails harmlessly
+  done
 }
 
 pull_extra_images() {  # pulls repo:latest for each --pull-extra pair, tags it to the bare local name the
@@ -154,7 +161,9 @@ if wait_healthy; then
   printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$ENV_NAME" "$SERVICE" "$TAG" >> .deploy-history
   pull_extra_images
   prune_old_tagged_images
-  docker image prune -f --filter "until=168h" >/dev/null || true
+  # Dangling = no tag left at all. pull_extra_images moves each sandbox's :latest to the new image, orphaning the
+  # previous one; nothing can roll back to an untagged image, and prune skips any image a container still uses.
+  docker image prune -f >/dev/null || true
   compose ps "$SERVICE"
   exit 0
 fi
