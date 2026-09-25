@@ -158,6 +158,9 @@ echo "    previous $TAG_VAR: ${PREVIOUS_TAG:-<none>}"
 
 set_env ECR_REGISTRY "$REGISTRY"
 set_env "$TAG_VAR" "$TAG"
+# the docker socket's group on THIS server (the judge joins it to start sandboxes); see infra-apply.sh
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"   # overridable for tests only
+if [ -e "$DOCKER_SOCK" ]; then set_env DOCKER_GID "$(stat -c %g "$DOCKER_SOCK")"; fi
 [ "$SET_RELEASE" -eq 1 ] && set_env APP_RELEASE "$TAG"
 
 compose pull "$SERVICE"

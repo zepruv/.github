@@ -43,10 +43,14 @@ cat > "$NEW_ENV"
 if grep -Env "^[A-Za-z_][A-Za-z0-9_]*='[^']*'$" "$NEW_ENV" | cut -d: -f1 | grep -q .; then
   die "line(s) $(grep -Env "^[A-Za-z_][A-Za-z0-9_]*='[^']*'$" "$NEW_ENV" | cut -d: -f1 | tr '\n' ' ')of the input are not NAME='value'"
 fi
-if grep -Eq "^(ECR_REGISTRY|APP_RELEASE|IMAGE_TAG|[A-Z0-9_]+_TAG)=" "$NEW_ENV"; then die "input contains deploy-managed variables"; fi
+if grep -Eq "^(ECR_REGISTRY|APP_RELEASE|IMAGE_TAG|DOCKER_GID|[A-Z0-9_]+_TAG)=" "$NEW_ENV"; then die "input contains deploy-managed variables"; fi
 
 # keep what the deploy scripts own (image tags, registry, release) from the current .env
 if [ -f .env ]; then grep -E "^(ECR_REGISTRY|APP_RELEASE|IMAGE_TAG|[A-Z0-9_]+_TAG)=" .env >> "$NEW_ENV" || true; fi
+# DOCKER_GID is a fact about THIS server (the group that owns the docker socket, which the judge joins to start sandboxes),
+# so it is read from the host every time and never stored in SSM: it differs between servers and after a docker reinstall.
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"   # overridable for tests only
+if [ -e "$DOCKER_SOCK" ]; then echo "DOCKER_GID=$(stat -c %g "$DOCKER_SOCK")" >> "$NEW_ENV"; fi
 chmod 600 "$NEW_ENV"
 
 compose_file="docker-compose.yml"
