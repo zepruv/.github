@@ -66,4 +66,11 @@ check "incoming .env file refused" "[ $rc -ne 0 ]"
 reset; printf "A='1'\n" | bash "$HERE/infra-apply.sh" --env staging --services 'x;rm -rf /' >"$WORK/out" 2>&1; rc=$?
 check "service list injection refused" "[ $rc -ne 0 ]"
 
+# DOCKER_GID comes from the host's docker socket, never from SSM
+touch "$WORK/fake.sock"; chgrp 4242 "$WORK/fake.sock" 2>/dev/null
+reset; DOCKER_SOCK="$WORK/fake.sock" run
+check "DOCKER_GID taken from the socket's group" "grep -qx 'DOCKER_GID=4242' $D/.env"
+reset; printf "%s\n" "DOCKER_GID='1'" | bash "$HERE/infra-apply.sh" --env staging --services "redis" --wait 5 >"$WORK/out" 2>&1
+check "DOCKER_GID in the SSM input is refused" "grep -q 'deploy-managed' $WORK/out"
+
 if [ $fail -eq 0 ]; then echo "ALL PASSED"; else echo "FAILURES"; cat "$WORK/out"; exit 1; fi
