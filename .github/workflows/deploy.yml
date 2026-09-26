@@ -46,6 +46,10 @@ on:
         description: "also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)"
         type: boolean
         default: false
+      migrate:
+        description: "apply the database migrations shipped in the image before starting it (needs MIGRATION_DATABASE_URL in the environment's SSM parameters)"
+        type: boolean
+        default: false
       health_url:
         description: "optional public URL that must answer 200 after the deploy"
         type: string
@@ -251,6 +255,7 @@ jobs:
           PULL_EXTRA: ${{ inputs.pull_extra }}
           PROFILE: ${{ inputs.profile }}
           SET_RELEASE: ${{ inputs.set_release }}
+          MIGRATE: ${{ inputs.migrate }}
           REGION: ${{ inputs.aws_region }}
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
@@ -272,6 +277,7 @@ jobs:
           [ -n "$PROFILE" ] && remote_args+=(--profile "$PROFILE")
           [ -n "$PULL_EXTRA" ] && remote_args+=(--pull-extra "$PULL_EXTRA")
           [ "$SET_RELEASE" = "true" ] && remote_args+=(--set-release)
+          [ "$MIGRATE" = "true" ] && remote_args+=(--migrate)
           printf -v REMOTE_ARGS '%q ' "${remote_args[@]}"
 
           # The password is the first stdin line (never a command-line argument); the rest of stdin is the script.

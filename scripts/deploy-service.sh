@@ -19,6 +19,9 @@
 #                                  service's own old local images for retention pruning; harmless to omit (skips it)
 #   [--profile <name>]            compose profile the service belongs to (e.g. full)
 #   [--set-release]               also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)
+#   [--migrate]                   before starting the new container, apply the database migrations the image ships (/migrations,
+#                                  run by /migrations/run.sh inside postgres:16-alpine). Needs MIGRATION_DATABASE_URL in .env; if it is
+#                                  missing the step is skipped with a notice. A failed migration stops the deploy and keeps the old version.
 #   [--wait <seconds>]            health wait, default 180
 #   [--keep <n>]                  local tagged images of this repo to retain (newest N), default 3
 #   [--pull-extra "repo=local ..."]  space-separated repo=localtag pairs pulled (and re-tagged to localtag) after
@@ -28,7 +31,7 @@
 set -euo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/zepruv/deploy/environments}"
-ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" SET_RELEASE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
+ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" SET_RELEASE=0 MIGRATE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
 
 die() { echo "deploy-service: $*" >&2; exit 1; }
 
@@ -42,6 +45,7 @@ while [ $# -gt 0 ]; do
     --ecr-repository) ECR_REPOSITORY="${2:-}"; shift 2 ;;
     --profile) PROFILE="${2:-}"; shift 2 ;;
     --set-release) SET_RELEASE=1; shift ;;
+    --migrate) MIGRATE=1; shift ;;
     --wait) WAIT_SECONDS="${2:-}"; shift 2 ;;
     --keep) KEEP_IMAGES="${2:-}"; shift 2 ;;
     --pull-extra) PULL_EXTRA="${2:-}"; shift 2 ;;
@@ -148,6 +152,29 @@ pull_extra_images() {  # pulls repo:latest for each --pull-extra pair, tags it t
   done
 }
 
+run_migrations() {  # applies the image's pending migrations; returns non-zero if they fail
+  [ "$MIGRATE" -eq 1 ] || return 0
+  [ -n "$ECR_REPOSITORY" ] || { echo "    --migrate needs --ecr-repository: skipping migrations" >&2; return 0; }
+  local url tmp cid rc
+  url="$(get_env MIGRATION_DATABASE_URL)"
+  url="${url#\'}"; url="${url%\'}"
+  if [ -z "$url" ]; then
+    echo "    MIGRATION_DATABASE_URL is not set in .env: skipping database migrations (the backend's startup check reports a stale database)"
+    return 0
+  fi
+  echo "==> applying database migrations from $REGISTRY/$ECR_REPOSITORY:$TAG"
+  tmp="$(mktemp -d)"
+  cid="$(docker create "$REGISTRY/$ECR_REPOSITORY:$TAG")" || { rm -rf "$tmp"; return 1; }
+  docker cp "$cid:/migrations" "$tmp/migrations" >/dev/null; rc=$?
+  docker rm "$cid" >/dev/null 2>&1 || true
+  if [ "$rc" -eq 0 ]; then
+    # the URL travels in the environment, never on a command line
+    DATABASE_URL="$url" docker run --rm -e DATABASE_URL -v "$tmp/migrations:/migrations:ro" postgres:16-alpine sh /migrations/run.sh --dir /migrations; rc=$?
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
 echo "==> [$ENV_NAME] deploying $SERVICE -> $TAG_VAR=$TAG"
 printf '%s' "$ECR_PASSWORD" | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
 unset ECR_PASSWORD
@@ -164,6 +191,14 @@ if [ -e "$DOCKER_SOCK" ]; then set_env DOCKER_GID "$(stat -c %g "$DOCKER_SOCK")"
 [ "$SET_RELEASE" -eq 1 ] && set_env APP_RELEASE "$TAG"
 
 compose pull "$SERVICE"
+
+if ! run_migrations; then
+  echo "!! database migrations failed: NOT deploying $TAG. $SERVICE keeps running ${PREVIOUS_TAG:-its current version}." >&2
+  if [ -n "$PREVIOUS_TAG" ]; then set_env "$TAG_VAR" "$PREVIOUS_TAG"; fi
+  if [ "$SET_RELEASE" -eq 1 ] && [ -n "$PREVIOUS_RELEASE" ]; then set_env APP_RELEASE "$PREVIOUS_RELEASE"; fi
+  exit 1
+fi
+
 compose up -d --no-deps "$SERVICE"
 
 if wait_healthy; then
