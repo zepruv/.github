@@ -2,6 +2,7 @@
 # Tests the prod promotion gate in .github/workflows/deploy.yml (the "Resolve image" step) against a real git history and
 # a fake `aws`. Needs Linux + git:
 #   docker run --rm -v "$PWD/..:/r:ro" ubuntu:24.04 bash -c 'apt-get update -qq && apt-get install -y -qq git python3 >/dev/null && bash /r/scripts/test_promotion_gate.sh'
+# shellcheck disable=SC2317,SC2329  # out()/check()/c()/s12() are invoked indirectly (eval, or only inside a function this file defines)
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT

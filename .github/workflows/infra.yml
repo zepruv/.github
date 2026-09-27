@@ -121,7 +121,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           set -euo pipefail
-          [ -n "$SSH_KEY" ] && [ -n "$KNOWN_HOSTS" ] && [ -n "$HOST" ] || { echo "::error::SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS and SSH_HOST secrets are required"; exit 1; }
+          if [ -z "$SSH_KEY" ] || [ -z "$KNOWN_HOSTS" ] || [ -z "$HOST" ]; then echo "::error::SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS and SSH_HOST secrets are required"; exit 1; fi
           install -m 700 -d "$HOME/.ssh"
           printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/deploy_key"; chmod 600 "$HOME/.ssh/deploy_key"
           printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"

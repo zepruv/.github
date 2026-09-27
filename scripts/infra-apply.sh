@@ -63,7 +63,7 @@ docker compose --project-directory "$DIR" --env-file "$NEW_ENV" -f "$compose_fil
 
 # ---- 3. apply (with backups so a failure can be undone) ----------------------------------------------------------------
 changed=""
-backup() { [ -f "$1" ] && cp -p "$1" "$1.prev" || true; }
+backup() { if [ -f "$1" ]; then cp -p "$1" "$1.prev"; fi; }
 backup .env
 if [ -d "$INCOMING" ]; then
   shopt -s dotglob
