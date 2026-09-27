@@ -13,6 +13,7 @@
 # Gates: logging | ruff | tests | gitleaks | semgrep | trivy-fs | docker
 # Needs: git, python3, uv (https://docs.astral.sh/uv), docker, trivy. Tool versions below match the workflows;
 # keep them in sync with ci-python.yml / security.yml.
+# shellcheck disable=SC2317,SC2329  # gates are invoked indirectly, via a variable holding the function name (run_gate "$name" "$fn")
 set -uo pipefail
 
 RUFF_VERSION=0.16.8
@@ -37,7 +38,7 @@ done
 
 cd "$REPO" || exit 2
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "not a git repository: $REPO" >&2; exit 2; }
-REPO="$(git rev-parse --show-toplevel)"; cd "$REPO"
+REPO="$(git rev-parse --show-toplevel)"; cd "$REPO" || exit 2
 
 selected() {  # selected <gate>: honours --only / --skip
   if [ -n "$ONLY" ]; then case ",$ONLY," in *",$1,"*) ;; *) return 1 ;; esac; fi
@@ -73,7 +74,7 @@ eval "$SETTINGS"
 TESTDIR="${CI_TEST_DIRECTORY:-}"; [ -n "$TESTDIR" ] || TESTDIR="$CI_WORKING_DIRECTORY"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ci-local.XXXXXX")"
-cleanup() { [ "$KEEP" -eq 1 ] && echo "kept: $TMP" || rm -rf "$TMP"; }
+cleanup() { if [ "$KEEP" -eq 1 ]; then echo "kept: $TMP"; else rm -rf "$TMP"; fi; }
 trap cleanup EXIT
 
 echo "== $CI_SERVICE_NAME ($CI_PROFILE) - settings from $CI_SOURCE =="
@@ -131,7 +132,7 @@ gate_tests() {
   [ "$CI_PROFILE" = python ] || { echo "tests gate is python-only in this script"; return 77; }
   [ "$CI_RUN_TESTS" = true ] || { echo "run_tests=false in the workflow"; return 77; }
   need uv "https://docs.astral.sh/uv" || return 1
-  local req key venv f
+  local key venv f
   key="$(cd "$COPY/$TESTDIR" && for f in $CI_REQUIREMENTS; do cat "$f"; done | shasum | cut -c1-12)"
   venv="${XDG_CACHE_HOME:-$HOME/.cache}/zepruv-ci-local/$CI_SERVICE_NAME-py$CI_PYTHON_VERSION-$key"
   if [ ! -x "$venv/bin/python" ]; then
