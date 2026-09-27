@@ -15,6 +15,9 @@ case "$*" in
   *"compose"*" ps -q"*) echo "container123" ;;
   "inspect --format {{if .State.Health}}"*) tag="$(grep -E '^BACKEND_TAG=' "$DEPLOY_ROOT/staging/.env" | cut -d= -f2-)"; var="FAKE_HEALTH_${tag//[^A-Za-z0-9]/_}"; echo "${!var:-healthy}" ;;
   "login "*) cat >/dev/null ;;
+  "create "*) echo "cid-mig" ;;
+  "cp "*) mkdir -p "${@: -1}" ;;
+  "run --rm "*postgres*) [ "${FAKE_MIGRATE_FAIL:-0}" = 1 ] && exit 1; echo "url-seen:${DATABASE_URL:-none}" >> "$FAKE_LOG" ;;
 esac
 exit 0
 FAKE
@@ -53,5 +56,25 @@ for bad in "--tag ../../etc" "--tag has\ space" "--env production" "--service Ba
   check "rejects $bad" "[ $rc -ne 0 ]"
 done
 check "rejected runs never touched docker compose" "! grep -q 'compose' $FAKE_LOG"
+
+# --- migrations ---
+reset_env
+run "${ARGS[@]}" --ecr-repository zepruv-backend --migrate --tag staging-9-mig0001 >/dev/null 2>&1; rc=$?
+check "--migrate without MIGRATION_DATABASE_URL is skipped, deploy proceeds" "[ $rc -eq 0 ] && ! grep -q 'postgres' $FAKE_LOG && grep -q 'up -d --no-deps backend-server' $FAKE_LOG"
+
+reset_env
+echo "MIGRATION_DATABASE_URL='postgresql://u:p@db:5432/x'" >> "$DEPLOY_ROOT/staging/.env"
+run "${ARGS[@]}" --ecr-repository zepruv-backend --migrate --tag staging-10-mig0002 >/dev/null 2>&1; rc=$?
+check "migrations run before the container is recreated" "[ $rc -eq 0 ] && [ \$(grep -n 'postgres:16-alpine' $FAKE_LOG | head -1 | cut -d: -f1) -lt \$(grep -n 'up -d --no-deps backend-server' $FAKE_LOG | head -1 | cut -d: -f1) ]"
+check "migration image comes from the image being deployed" "grep -q 'create 123456789012.dkr.ecr.ap-south-2.amazonaws.com/zepruv-backend:staging-10-mig0002' $FAKE_LOG"
+check "the database URL reached the migration container through the environment, unquoted" "grep -q '^url-seen:postgresql://u:p@db:5432/x$' $FAKE_LOG"
+check "the database URL is never on a docker command line" "! grep -q '^docker .*u:p@db' $FAKE_LOG"
+
+reset_env
+echo "MIGRATION_DATABASE_URL='postgresql://u:p@db:5432/x'" >> "$DEPLOY_ROOT/staging/.env"
+FAKE_MIGRATE_FAIL=1 run "${ARGS[@]}" --ecr-repository zepruv-backend --migrate --tag staging-11-mig0003 >/dev/null 2>&1; rc=$?
+check "a failed migration exits 1" "[ $rc -eq 1 ]"
+check "a failed migration never recreates the service" "! grep -q 'up -d --no-deps backend-server' $FAKE_LOG"
+check "a failed migration puts the previous tag back" "grep -q '^BACKEND_TAG=prev-1$' $DEPLOY_ROOT/staging/.env && grep -q '^APP_RELEASE=prev-1$' $DEPLOY_ROOT/staging/.env"
 
 exit $fail
