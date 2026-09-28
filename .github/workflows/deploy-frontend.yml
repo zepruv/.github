@@ -201,7 +201,9 @@ jobs:
           # this check reach it without an interactive SSO login, while everything else on the domain stays protected.
           access_headers=()
           if [ -n "$CF_ACCESS_CLIENT_ID" ] || [ -n "$CF_ACCESS_CLIENT_SECRET" ]; then
-            [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ] || { echo "::error::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must both be set, or neither"; exit 1; }
+            if [ -z "$CF_ACCESS_CLIENT_ID" ] || [ -z "$CF_ACCESS_CLIENT_SECRET" ]; then
+              echo "::error::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must both be set, or neither"; exit 1
+            fi
             access_headers=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
           fi
           for i in $(seq 1 18); do
