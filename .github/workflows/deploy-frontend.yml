@@ -65,6 +65,11 @@ on:
         description: "ID of the zepruv-ci-reader GitHub App; with CI_APP_PRIVATE_KEY it lets the install read the private zepruv/workspace-ui package. Optional."
         required: false
       CI_APP_PRIVATE_KEY:
+      CF_ACCESS_CLIENT_ID:
+        description: "Optional: a Cloudflare Access Service Token's Client ID, sent with the health check when health_url is itself behind Cloudflare Access. Leave unset for a public health_url."
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        description: "Optional: the matching Service Token Client Secret. Both must be set together, or neither."
         required: false
 
 permissions:
@@ -209,14 +214,25 @@ jobs:
         env:
           HEALTH_URL: ${{ inputs.health_url }}
           DEPLOY_ENV: ${{ inputs.environment }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           marker="${HEALTH_URL%/}/version.txt"
+          # Only present when health_url sits behind Cloudflare Access (e.g. the admin frontend): a Service Token lets
+          # this check reach it without an interactive SSO login, while everything else on the domain stays protected.
+          access_headers=()
+          if [ -n "$CF_ACCESS_CLIENT_ID" ] || [ -n "$CF_ACCESS_CLIENT_SECRET" ]; then
+            if [ -z "$CF_ACCESS_CLIENT_ID" ] || [ -z "$CF_ACCESS_CLIENT_SECRET" ]; then
+              echo "::error::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must both be set, or neither"; exit 1
+            fi
+            access_headers=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+          fi
           for i in $(seq 1 18); do
-            got="$(curl -sS --max-time 15 -H 'Cache-Control: no-cache' "${marker}?v=${BUILT_SHA}" 2>/dev/null | head -n1 | tr -d '\r' || true)"
+            got="$(curl -sS --max-time 15 -H 'Cache-Control: no-cache' "${access_headers[@]}" "${marker}?v=${BUILT_SHA}" 2>/dev/null | head -n1 | tr -d '\r' || true)"
             echo "attempt $i: $marker -> '${got:0:12}' (want ${BUILT_SHA::12})"
             [ "$got" = "$BUILT_SHA" ] && { echo "ok: $HEALTH_URL serves this commit"; exit 0; }
             sleep 10
           done
-          echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, and that no leftover DNS record blocks it."
+          echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, that no leftover DNS record blocks it, and - if this domain is behind Cloudflare Access - that CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET are set and the Access policy allows that Service Token."
           exit 1
