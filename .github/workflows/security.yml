@@ -141,7 +141,10 @@ jobs:
             args+=(--baseline-commit "$BASE_SHA")
           elif [ -n "${BEFORE_SHA//0/}" ]; then
             args+=(--baseline-commit "$BEFORE_SHA")
-          else
+          elif git rev-parse --verify --quiet "HEAD~1" >/dev/null; then
             args+=(--baseline-commit "HEAD~1")
+          else
+            # first commit of a repo (or a push of a single root commit): nothing to compare with, so everything is new
+            echo "no parent commit: scanning the whole tree"
           fi
           semgrep "${args[@]}"
