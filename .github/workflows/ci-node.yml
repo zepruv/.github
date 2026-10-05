@@ -43,6 +43,12 @@ on:
       dockerfile:
         type: string
         default: "Dockerfile"
+    secrets:
+      CI_APP_ID:
+        description: "ID of the zepruv-ci-reader GitHub App; with CI_APP_PRIVATE_KEY it lets the install read the private zepruv/workspace-ui package. Optional."
+        required: false
+      CI_APP_PRIVATE_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -84,6 +90,8 @@ jobs:
     name: Lint, build, tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
     defaults:
       run:
         working-directory: ${{ inputs.working_directory }}
@@ -96,6 +104,22 @@ jobs:
           repository: zepruv/.github
           path: .ci
           persist-credentials: false
+
+      - name: Token to read the shared Workspace UI package
+        id: wsui
+        if: ${{ env.CI_APP_ID != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: zepruv
+          repositories: workspace-ui
+
+      - name: Let npm fetch private zepruv packages
+        if: ${{ steps.wsui.outputs.token != '' }}
+        env:
+          READ_TOKEN: ${{ steps.wsui.outputs.token }}
+        run: git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - uses: actions/setup-node@v4
         with:

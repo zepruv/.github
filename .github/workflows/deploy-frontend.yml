@@ -61,6 +61,11 @@ on:
         required: true
       CLOUDFLARE_ACCOUNT_ID:
         required: true
+      CI_APP_ID:
+        description: "ID of the zepruv-ci-reader GitHub App; with CI_APP_PRIVATE_KEY it lets the install read the private zepruv/workspace-ui package. Optional."
+        required: false
+      CI_APP_PRIVATE_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -79,6 +84,8 @@ jobs:
     name: Build and deploy (${{ inputs.environment }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
     defaults:
       run:
         working-directory: ${{ inputs.working_directory }}
@@ -130,6 +137,22 @@ jobs:
             echo "$name=$value" >> "$GITHUB_ENV"
             echo "build var: $name"
           done <<< "$BUILD_ENV"
+
+      - name: Token to read the shared Workspace UI package
+        id: wsui
+        if: ${{ env.CI_APP_ID != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: zepruv
+          repositories: workspace-ui
+
+      - name: Let npm fetch private zepruv packages
+        if: ${{ steps.wsui.outputs.token != '' }}
+        env:
+          READ_TOKEN: ${{ steps.wsui.outputs.token }}
+        run: git config --global url."https://x-access-token:${READ_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Install
         run: npm ci
