@@ -23,9 +23,13 @@ class ConvertTests(unittest.TestCase):
             s.convert(payload(A="a\nb"), "/zepruv/staging/")
 
     def test_rejects_deploy_managed_names(self):
-        for name in ("BACKEND_TAG", "ECR_REGISTRY", "APP_RELEASE", "IMAGE_TAG"):
+        for name in ("BACKEND_TAG", "ECR_REGISTRY", "APP_RELEASE", "IMAGE_TAG", "RELEASE_VERSION", "BACKEND_RELEASE_VERSION", "INTERVIEWER_RELEASE_VERSION"):
             with self.assertRaises(s.EnvError, msg=name):
                 s.convert(payload(**{name: "x"}), "/zepruv/staging/")
+
+    def test_livekit_style_version_variables_are_still_allowed(self):
+        out = s.convert(payload(LIVEKIT_VERSION="v1.9", EGRESS_VERSION="v1.8"), "/zepruv/staging/", min_keys=1)
+        self.assertEqual(out, ["EGRESS_VERSION='v1.8'", "LIVEKIT_VERSION='v1.9'"])
 
     def test_rejects_bad_names_and_nested(self):
         with self.assertRaises(s.EnvError):

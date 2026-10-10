@@ -7,7 +7,7 @@ Rules (all violations abort with a message that names the parameter, never its v
   * flat parameters only: /zepruv/staging/JWT_SECRET  ->  JWT_SECRET
   * names must look like env vars
   * values must be single-line and contain no single quote (they are written as '...' so compose never interpolates `$`)
-  * names owned by the deploy tooling (ECR_REGISTRY, APP_RELEASE, *_TAG) are refused: they must not live in SSM
+  * names owned by the deploy tooling (ECR_REGISTRY, APP_RELEASE, RELEASE_VERSION, *_TAG, *_RELEASE_VERSION) are refused: they must not live in SSM
 """
 import argparse
 import json
@@ -15,7 +15,7 @@ import re
 import sys
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-MANAGED_RE = re.compile(r"^(ECR_REGISTRY|APP_RELEASE|IMAGE_TAG|[A-Z0-9_]+_TAG)$")
+MANAGED_RE = re.compile(r"^(ECR_REGISTRY|APP_RELEASE|IMAGE_TAG|RELEASE_VERSION|[A-Z0-9_]+_TAG|[A-Z0-9_]+_RELEASE_VERSION)$")
 
 
 class EnvError(Exception):

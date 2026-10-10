@@ -5,7 +5,7 @@
   ./ssm_push_env.py --env staging --file .env.staging               # write /zepruv/staging/<NAME> for every variable
 
 Standard tier + the default aws/ssm key = free. Values never appear on a command line or in output.
-Skipped on purpose: empty values (SSM cannot store them), and names owned by the deploy scripts (ECR_REGISTRY, *_TAG, APP_RELEASE).
+Skipped on purpose: empty values (SSM cannot store them), and names owned by the deploy scripts (ECR_REGISTRY, *_TAG, APP_RELEASE, RELEASE_VERSION, *_RELEASE_VERSION).
 """
 import argparse
 import json

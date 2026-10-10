@@ -20,6 +20,15 @@ name: "Reusable: build and deploy a frontend to Cloudflare Workers (static asset
 # catches a domain that was never attached or a stale deployment.
 #
 # Never run `wrangler deploy` without --env: the shared top level carries no domain or vars.
+#
+# Versioning (CICD.md, section "Versioning"): the app is built with VITE_APP_VERSION=<MAJOR.RELEASE.HOTFIX> and
+# VITE_APP_COMMIT=<sha12>, and ships /version.json ({version, commit, environment}) next to the /version.txt marker (whose first
+# line stays the full commit sha: the health check above reads it). `staging` computes the next version from the merged PR
+# (scripts/compute-version.sh through .github/actions/version), and only after the deploy and the health check succeeded does the
+# `release` job create the git tag vX.Y.Z and the GitHub Release. `production` builds the commit that was verified on staging and
+# reuses the version that commit already has (an unversioned promotion merge ships the newest release it contains; a hotfix PR
+# merged into main gets the next HOTFIX number). Other environments (e.g. `test`) are not versioned: they report the commit.
+# Callers must grant `contents: write` and `pull-requests: read` (a reusable workflow cannot raise the permissions it is given).
 
 on:
   workflow_call:
@@ -85,8 +94,57 @@ env:
   WRANGLER_SEND_METRICS: "false"
 
 jobs:
+  # Read-only: decides the version (nothing is created here, so a failed deploy never consumes a number).
+  version:
+    name: Release version (${{ inputs.environment }})
+    if: ${{ inputs.environment == 'staging' || inputs.environment == 'production' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      version: ${{ steps.v.outputs.version }}
+      kind: ${{ steps.v.outputs.kind }}
+      pending: ${{ steps.v.outputs.pending }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - id: v
+        uses: zepruv/.github/.github/actions/version@main
+        with:
+          mode: resolve
+          github_token: ${{ github.token }}
+          sha: ${{ steps.sha.outputs.sha }}
+          role: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
+          out_dir: ${{ runner.temp }}/release
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          KIND: ${{ steps.v.outputs.kind }}
+          REUSED: ${{ steps.v.outputs.reused }}
+          APPROXIMATE: ${{ steps.v.outputs.approximate }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+        run: |
+          {
+            echo "### Release version (${DEPLOY_ENV})"
+            echo "- version: **${VERSION:-none}** (${KIND}; reusing an existing tag: ${REUSED}; newest release contained in the commit: ${APPROXIMATE})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Build and deploy (${{ inputs.environment }})
+    needs: version
+    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -109,7 +167,8 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          # the commit the version job looked at, so a moving branch name cannot make the two jobs disagree
+          ref: ${{ needs.version.outputs.sha || inputs.ref }}
           persist-credentials: false
 
       - name: Record the commit being built
@@ -165,22 +224,28 @@ jobs:
       - name: Build
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          export VITE_APP_VERSION="${BUILT_SHA::12}"   # the app can show which build it is; a .env.<mode> file can not override the commit
+          # The app can show which build it is; a .env.<mode> file can not override these. An unversioned environment reports the commit.
+          export VITE_APP_VERSION="${RELEASE_VERSION:-${BUILT_SHA::12}}"
+          export VITE_APP_COMMIT="${BUILT_SHA::12}"
           bash -c "$BUILD_COMMAND"
 
       - name: Check the build output and add the version marker
         env:
           OUTPUT_DIR: ${{ inputs.output_dir }}
           DEPLOY_ENV: ${{ inputs.environment }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           [ -f "$OUTPUT_DIR/index.html" ] || { echo "::error::$OUTPUT_DIR/index.html missing - the build produced no site"; exit 1; }
           printf '%s\n%s\n' "$BUILT_SHA" "$DEPLOY_ENV" > "$OUTPUT_DIR/version.txt"
+          # the readable form of the same marker; every value was validated above (sha, environment name, X.Y.Z)
+          printf '{"version":"%s","commit":"%s","environment":"%s"}\n' "$RELEASE_VERSION" "$BUILT_SHA" "$DEPLOY_ENV" > "$OUTPUT_DIR/version.json"
           # never cached, or the post-deploy check could read a stale marker
-          printf '\n/version.txt\n  Cache-Control: no-store\n' >> "$OUTPUT_DIR/_headers"
-          echo "output: $(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ') files, $(du -sh "$OUTPUT_DIR" | cut -f1); version marker ${BUILT_SHA::12} ($DEPLOY_ENV)"
+          printf '\n/version.txt\n  Cache-Control: no-store\n\n/version.json\n  Cache-Control: no-store\n' >> "$OUTPUT_DIR/_headers"
+          echo "output: $(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ') files, $(du -sh "$OUTPUT_DIR" | cut -f1); version marker ${BUILT_SHA::12} ($DEPLOY_ENV), release version '${RELEASE_VERSION:-none}'"
 
       - name: Scan the bundle for secrets (gitleaks)
         env:
@@ -201,13 +266,19 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DEPLOY_ENV: ${{ inputs.environment }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           # wrangler refuses an --env that has no block in wrangler.jsonc, so a typo cannot deploy anything.
           npx --yes "wrangler@${WRANGLER_VERSION}" deploy --env "$DEPLOY_ENV" \
-            --message "${DEPLOY_ENV}: ${GITHUB_REPOSITORY}@${BUILT_SHA::12}" | tee "$RUNNER_TEMP/wrangler.out"
+            --message "${DEPLOY_ENV}: ${GITHUB_REPOSITORY}@${BUILT_SHA::12}${RELEASE_VERSION:+ v$RELEASE_VERSION}" | tee "$RUNNER_TEMP/wrangler.out"
           version="$(grep -oE 'Current Version ID: [0-9a-f-]+' "$RUNNER_TEMP/wrangler.out" | tail -n1 || true)"
-          { echo "### Deployed \`${DEPLOY_ENV}\`"; echo "- commit: \`${BUILT_SHA::12}\`"; [ -n "$version" ] && echo "- ${version}"; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Deployed \`${DEPLOY_ENV}\`"
+            echo "- commit: \`${BUILT_SHA::12}\`"
+            [ -z "$RELEASE_VERSION" ] || echo "- release version: **${RELEASE_VERSION}**"
+            [ -z "$version" ] || echo "- ${version}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify the environment URL serves this commit
         if: ${{ inputs.health_url != '' }}
@@ -236,3 +307,55 @@ jobs:
           done
           echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, that no leftover DNS record blocks it, and - if this domain is behind Cloudflare Access - that CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET are set and the Access policy allows that Service Token."
           exit 1
+
+  # Only after the deploy and the health check succeeded does the version become real: a failed run never consumes a number.
+  release:
+    name: Tag and publish the release (${{ inputs.environment }})
+    needs: [version, deploy]
+    if: ${{ !cancelled() && needs.deploy.result == 'success' && needs.version.outputs.pending == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The one job that writes to the repository: it creates the tag and the GitHub Release, nothing else.
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # Same read-only decision as in the version job: it rebuilds the PR list the release notes are made from.
+      - id: r
+        uses: zepruv/.github/.github/actions/version@main
+        with:
+          mode: resolve
+          github_token: ${{ github.token }}
+          sha: ${{ needs.version.outputs.sha }}
+          role: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
+          out_dir: ${{ runner.temp }}/release
+
+      - id: m
+        uses: zepruv/.github/.github/actions/version@main
+        with:
+          mode: mint
+          github_token: ${{ github.token }}
+          sha: ${{ needs.version.outputs.sha }}
+          out_dir: ${{ runner.temp }}/release
+          kind: ${{ needs.version.outputs.kind }}
+          version: ${{ needs.version.outputs.version }}
+          previous: ${{ steps.r.outputs.previous }}
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.m.outputs.version }}
+          CREATED: ${{ steps.m.outputs.created }}
+          MISMATCH: ${{ steps.m.outputs.mismatch }}
+        run: |
+          {
+            echo "### Release"
+            echo "- released **v${VERSION}** (new tag: ${CREATED})"
+            if [ "$MISMATCH" = true ]; then echo "- WARNING: the site was built with a different version number that was taken meanwhile; the deployed app reports the built one"; fi
+          } >> "$GITHUB_STEP_SUMMARY"

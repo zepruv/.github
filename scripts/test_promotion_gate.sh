@@ -29,6 +29,7 @@ PY
 cat > "$WORK/bin/aws" <<'FAKE'
 #!/usr/bin/env bash
 case "$*" in
+  *"imageDetails[0].imageTags[]"*) printf '%s\t' $FAKE_VERSION_TAGS; echo; exit 0 ;;   # the tags of the promoted image (version alias lookup)
   *"--image-ids imageTag="*) all="$*"; want="${all##*imageTag=}"; want="${want%% *}"; for t in $FAKE_TAGS; do [ "$t" = "$want" ] && exit 0; done; exit 1 ;;
   *"describe-images"*"--query"*) printf '%s\t' $FAKE_TAGS; echo ;;
 esac
@@ -51,7 +52,7 @@ fail=0; check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; se
 s12() { echo "${1:0:12}"; }
 
 FAKE_TAGS="sha-$(s12 "$A") staging-ok-$(s12 "$A") sha-$(s12 "$B") sha-$(s12 "$S1") staging-ok-$(s12 "$S1")"
-export FAKE_TAGS
+export FAKE_TAGS FAKE_VERSION_TAGS=""
 
 FAKE_TAGS="" run staging; check "staging builds a commit whose image does not exist yet" "[ \"\$(out build)\" = true ] && [ \"\$(out tag)\" = sha-$(s12 "$B") ]"
 run staging;           check "staging skips the build when the image for the commit already exists (re-run)" "[ \"\$(out build)\" = false ]"
@@ -61,6 +62,20 @@ run prod "$(s12 "$B")";  check "prod refuses a main commit that was never verifi
 FAKE_TAGS="$FAKE_TAGS staging-ok-$(s12 "$B")"
 export FAKE_TAGS
 run prod "$(s12 "$B")";  check "prod accepts a verified commit that is on main" "[ \"\$(out tag)\" = sha-$(s12 "$B") ]"
+# the release version is read back from the image's alias tags (only well-formed vX.Y.Z count; the highest wins)
+FAKE_VERSION_TAGS="sha-$(s12 "$B") staging-ok-$(s12 "$B") v2.461.9 v2.462.0 v2.462.0-rc1 vfoo v2.5"
+export FAKE_VERSION_TAGS
+run prod "$(s12 "$B")";  check "prod reads the release version from the image's ECR alias tag (2.462.0, ignoring rc/malformed tags)" "[ \"\$(out version)\" = 2.462.0 ] && [ \"\$(out tag)\" = sha-$(s12 "$B") ]"
+FAKE_VERSION_TAGS="sha-$(s12 "$B") staging-ok-$(s12 "$B")"
+export FAKE_VERSION_TAGS
+run prod "$(s12 "$B")";  check "prod still promotes an image built before versioning (no alias: empty version, warning, gate unchanged)" "[ \"\$(out version)\" = '' ] && [ \"\$(out tag)\" = sha-$(s12 "$B") ] && grep -q 'no version tag' $WORK/log"
+FAKE_VERSION_TAGS="v9.9.9"
+export FAKE_VERSION_TAGS
+run prod "$(s12 "$S1")"; check "a version alias never lets an unverified/not-on-main commit through" "! grep -q '^sha=' $GITHUB_OUTPUT"
+FAKE_VERSION_TAGS="v9.9.9"
+run staging;           check "staging resolves no version here (the version job computes it)" "[ \"\$(out version)\" = '' ]"
+FAKE_VERSION_TAGS=""
+export FAKE_VERSION_TAGS
 FAKE_TAGS="sha-$(s12 "$S1") staging-ok-$(s12 "$S1")"
 export FAKE_TAGS
 git checkout -q -b squashed main; git checkout -q staging -- f; git commit -qam "squash of staging"; git branch -q -f main squashed; git checkout -q main

@@ -1,0 +1,110 @@
+name: Release version
+description: >
+  Automatic MAJOR.RELEASE.HOTFIX versioning (scripts/compute-version.sh in this repository).
+  mode=resolve decides the version of a commit WITHOUT creating anything (safe to run before the build);
+  mode=mint creates the git tag vX.Y.Z (atomic, retried on collision, reuses the tag a commit already has) and a GitHub Release.
+  The calling job needs a full checkout (fetch-depth: 0, fetch-tags: true) and, for resolve, `pull-requests: read`;
+  for mint `contents: write` (+ `pull-requests: read`). The token is only used by the `gh` CLI inside the script.
+inputs:
+  mode:
+    description: resolve | mint
+    required: true
+  github_token:
+    description: GITHUB_TOKEN of the calling job
+    required: true
+  repository:
+    description: owner/name whose tags and PRs are used
+    required: false
+    default: ${{ github.repository }}
+  sha:
+    description: commit that is built / released
+    required: true
+  role:
+    description: "resolve only: staging (mints a new version for an unversioned commit) | production (reuses; only a hotfix PR gets a new one)"
+    required: false
+    default: staging
+  out_dir:
+    description: directory for the working files (tags, PR list, notes, result.env); the same directory must be used by resolve and mint
+    required: true
+  extra_tags_file:
+    description: optional file with more version tags (one per line, e.g. the ECR image tags) that also count for the counter
+    required: false
+    default: ""
+  kind:
+    description: "mint only: staging-pr | direct-push | hotfix | breaking (output `kind` of resolve)"
+    required: false
+    default: ""
+  version:
+    description: "mint only: the version resolve returned and the image was built with"
+    required: false
+    default: ""
+  previous:
+    description: "mint only: previous tag, for the changelog link (output `previous` of resolve)"
+    required: false
+    default: ""
+  main_ref:
+    description: ref that holds the prod releases (hotfix versions are computed from the tags reachable from it)
+    required: false
+    default: origin/main
+  mint_retries:
+    description: "mint only: how often to recompute and retry when the tag was taken by another commit meanwhile"
+    required: false
+    default: "5"
+outputs:
+  version:
+    description: "X.Y.Z (empty when the commit has no version and none may be created)"
+    value: ${{ steps.run.outputs.version }}
+  tag:
+    description: vX.Y.Z
+    value: ${{ steps.run.outputs.tag }}
+  kind:
+    description: staging-pr | direct-push | hotfix | breaking
+    value: ${{ steps.run.outputs.kind }}
+  bump:
+    description: "seed | release | breaking | hotfix | reuse | reachable"
+    value: ${{ steps.run.outputs.bump }}
+  reused:
+    description: "true when the commit already had a version tag"
+    value: ${{ steps.run.outputs.reused }}
+  pending:
+    description: "true when mint still has to create the tag"
+    value: ${{ steps.run.outputs.pending }}
+  approximate:
+    description: "true when the version is the newest release reachable from the commit, not a tag on it"
+    value: ${{ steps.run.outputs.approximate }}
+  direct_push:
+    description: "true when the commit(s) came in without any pull request"
+    value: ${{ steps.run.outputs.direct_push }}
+  previous:
+    description: "the highest tag reachable from the commit (base of the changelog), empty for the first version"
+    value: ${{ steps.run.outputs.previous }}
+  created:
+    description: "mint: true when this run created the tag"
+    value: ${{ steps.run.outputs.created }}
+  mismatch:
+    description: "mint: true when the released version differs from the one the image was built with"
+    value: ${{ steps.run.outputs.mismatch }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ inputs.repository }}
+        SHA: ${{ inputs.sha }}
+        ROLE: ${{ inputs.role }}
+        OUT_DIR: ${{ inputs.out_dir }}
+        EXTRA_TAGS_FILE: ${{ inputs.extra_tags_file }}
+        KIND: ${{ inputs.kind }}
+        VERSION: ${{ inputs.version }}
+        PREVIOUS: ${{ inputs.previous }}
+        MAIN_REF: ${{ inputs.main_ref }}
+        MINT_RETRIES: ${{ inputs.mint_retries }}
+        SCRIPT: ${{ github.action_path }}/../../../scripts/compute-version.sh
+      run: |
+        set -euo pipefail
+        case "$MODE" in resolve | mint) ;; *) echo "::error::mode must be resolve or mint"; exit 1 ;; esac
+        [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be a full 40-character commit id"; exit 1; }
+        bash "$SCRIPT" "$MODE"

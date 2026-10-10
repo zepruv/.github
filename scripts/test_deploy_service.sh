@@ -25,7 +25,7 @@ chmod +x "$WORK/bin/docker"
 
 fail=0
 check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; fail=1; fi; }
-reset_env() { printf 'ECR_REGISTRY=old\nBACKEND_TAG=prev-1\nAPP_RELEASE=prev-1\nKEEP=me\n' > "$DEPLOY_ROOT/staging/.env"; chmod 640 "$DEPLOY_ROOT/staging/.env"; : > "$FAKE_LOG"; }
+reset_env() { printf 'ECR_REGISTRY=old\nBACKEND_TAG=prev-1\nAPP_RELEASE=prev-1\nBACKEND_RELEASE_VERSION=1.0.0\nRELEASE_VERSION=1.0.0\nKEEP=me\n' > "$DEPLOY_ROOT/staging/.env"; chmod 640 "$DEPLOY_ROOT/staging/.env"; : > "$FAKE_LOG"; }
 run() { { printf 'secret-pw\n'; cat "$HERE/deploy-service.sh"; } | { IFS= read -r ECR_PASSWORD; export ECR_PASSWORD; bash -s -- "$@"; }; }
 ARGS=(--env staging --service backend-server --tag-var BACKEND_TAG --registry 123456789012.dkr.ecr.ap-south-2.amazonaws.com --set-release --wait 10)
 
@@ -50,12 +50,37 @@ check "rolled back release too" "grep -q '^APP_RELEASE=prev-1$' $DEPLOY_ROOT/sta
 check "service restarted after rollback" "[ \$(grep -c 'up -d --no-deps backend-server' $FAKE_LOG) -eq 2 ]"
 
 reset_env
-for bad in "--tag ../../etc" "--tag has\ space" "--env production" "--service Bad_Name" "--registry evil.example.com"; do
+for bad in "--tag ../../etc" "--tag has\ space" "--env production" "--service Bad_Name" "--registry evil.example.com" "--release-version 1.2" "--release-version v1.2.3" "--release-version 1.2.3-rc1" "--release-version 01.2.3"; do
   # shellcheck disable=SC2086
   args=("${ARGS[@]}" --tag ok-tag); eval "run ${args[*]} $bad" >/dev/null 2>&1; rc=$?
   check "rejects $bad" "[ $rc -ne 0 ]"
 done
 check "rejected runs never touched docker compose" "! grep -q 'compose' $FAKE_LOG"
+
+# --- release version ---
+reset_env
+run "${ARGS[@]}" --tag sha-aaa111111111 --release-version 2.462.0 >/dev/null 2>&1; rc=$?
+check "release version: healthy deploy exits 0" "[ $rc -eq 0 ]"
+check "release version: per-service variable written (BACKEND_TAG -> BACKEND_RELEASE_VERSION)" "grep -q '^BACKEND_RELEASE_VERSION=2.462.0$' $DEPLOY_ROOT/staging/.env"
+check "release version: --set-release also writes RELEASE_VERSION and still APP_RELEASE=<tag>" "grep -q '^RELEASE_VERSION=2.462.0$' $DEPLOY_ROOT/staging/.env && grep -q '^APP_RELEASE=sha-aaa111111111$' $DEPLOY_ROOT/staging/.env"
+
+reset_env
+run "${ARGS[@]}" --tag sha-bbb222222222 >/dev/null 2>&1; rc=$?
+check "no version given (unversioned image): per-service variable emptied, RELEASE_VERSION falls back to the tag" "[ $rc -eq 0 ] && grep -q '^BACKEND_RELEASE_VERSION=$' $DEPLOY_ROOT/staging/.env && grep -q '^RELEASE_VERSION=sha-bbb222222222$' $DEPLOY_ROOT/staging/.env"
+
+reset_env
+run --env staging --service interview-agent --tag-var INTERVIEWER_TAG --registry 123456789012.dkr.ecr.ap-south-2.amazonaws.com --wait 10 --tag sha-ccc333333333 --release-version 3.1.0 >/dev/null 2>&1; rc=$?
+check "without --set-release only the service's own variable is written (global names untouched)" "[ $rc -eq 0 ] && grep -q '^INTERVIEWER_RELEASE_VERSION=3.1.0$' $DEPLOY_ROOT/staging/.env && grep -q '^RELEASE_VERSION=1.0.0$' $DEPLOY_ROOT/staging/.env && grep -q '^APP_RELEASE=prev-1$' $DEPLOY_ROOT/staging/.env"
+
+reset_env
+export FAKE_HEALTH_sha_ddd444444444=unhealthy
+run "${ARGS[@]}" --tag sha-ddd444444444 --release-version 2.463.0 >/dev/null 2>&1; rc=$?
+check "release version: an unhealthy deploy rolls the version variables back" "[ $rc -eq 1 ] && grep -q '^BACKEND_RELEASE_VERSION=1.0.0$' $DEPLOY_ROOT/staging/.env && grep -q '^RELEASE_VERSION=1.0.0$' $DEPLOY_ROOT/staging/.env && grep -q '^APP_RELEASE=prev-1$' $DEPLOY_ROOT/staging/.env"
+
+reset_env
+echo "MIGRATION_DATABASE_URL='postgresql://u:p@db:5432/x'" >> "$DEPLOY_ROOT/staging/.env"
+FAKE_MIGRATE_FAIL=1 run "${ARGS[@]}" --ecr-repository zepruv-backend --migrate --tag sha-eee555555555 --release-version 2.464.0 >/dev/null 2>&1; rc=$?
+check "release version: a failed migration restores the version variables" "[ $rc -eq 1 ] && grep -q '^BACKEND_RELEASE_VERSION=1.0.0$' $DEPLOY_ROOT/staging/.env && grep -q '^RELEASE_VERSION=1.0.0$' $DEPLOY_ROOT/staging/.env"
 
 # --- migrations ---
 reset_env
