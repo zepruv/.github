@@ -23,7 +23,7 @@ fail=0
 check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; fail=1; fi; }
 reset() {
   rm -rf "$D"; mkdir -p "$D/.incoming"
-  printf 'ECR_REGISTRY=old\nBACKEND_TAG=sha-1\nOLD_SECRET=gone\n' > "$D/.env"; chmod 600 "$D/.env"
+  printf 'ECR_REGISTRY=old\nBACKEND_TAG=sha-1\nBACKEND_RELEASE_VERSION=2.462.0\nRELEASE_VERSION=2.462.0\nOLD_SECRET=gone\n' > "$D/.env"; chmod 600 "$D/.env"
   echo "v1" > "$D/docker-compose.yml"; echo "v1" > "$D/nginx.conf"; echo "v1" > "$D/livekit.yaml"
   echo "v2" > "$D/.incoming/docker-compose.yml"; echo "v2" > "$D/.incoming/nginx.conf"
   : > "$FAKE_LOG"
@@ -35,6 +35,7 @@ check "success exit code" "[ $rc -eq 0 ]"
 check "secrets written verbatim, single-quoted" "grep -q \"^JWT_SECRET='p\\\$ss w#rd'\$\" $D/.env"
 check "old secrets removed" "! grep -q OLD_SECRET $D/.env"
 check "deploy-managed tag preserved" "grep -q '^BACKEND_TAG=sha-1$' $D/.env && grep -q '^ECR_REGISTRY=old$' $D/.env"
+check "deploy-managed release versions preserved" "grep -q '^BACKEND_RELEASE_VERSION=2.462.0$' $D/.env && grep -q '^RELEASE_VERSION=2.462.0$' $D/.env"
 check ".env is mode 600" "[ \"\$(stat -c %a $D/.env)\" = 600 ]"
 check "incoming compose installed" "grep -q v2 $D/docker-compose.yml && [ ! -d $D/.incoming ]"
 check "validated before applying" "grep -n 'config -q' $FAKE_LOG | head -1 | grep -q ."
@@ -59,6 +60,8 @@ check "malformed line refused" "[ $rc -ne 0 ] && grep -q OLD_SECRET $D/.env"
 
 reset; printf "BACKEND_TAG='evil'\n" | bash "$HERE/infra-apply.sh" --env staging >"$WORK/out" 2>&1; rc=$?
 check "managed variable in input refused" "[ $rc -ne 0 ] && grep -q '^BACKEND_TAG=sha-1$' $D/.env"
+reset; printf "BACKEND_RELEASE_VERSION='9.9.9'\n" | bash "$HERE/infra-apply.sh" --env staging >"$WORK/out" 2>&1; rc=$?
+check "release version variable in input refused" "[ $rc -ne 0 ] && grep -q '^BACKEND_RELEASE_VERSION=2.462.0$' $D/.env"
 
 reset; echo x > "$D/.incoming/.env"; run; rc=$?
 check "incoming .env file refused" "[ $rc -ne 0 ]"

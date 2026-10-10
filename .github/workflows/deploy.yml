@@ -7,6 +7,13 @@ name: "Reusable: build, promote and deploy a service"
 #            on `main` (ancestor, or identical tree for squash merges). This is the promotion gate that GitHub
 #            branch protection would normally provide, done in the workflow so it works on the Free plan.
 #
+# Versioning (see CICD.md, section "Versioning"): staging computes the release version MAJOR.RELEASE.HOTFIX from the merged PR
+# (scripts/compute-version.sh through .github/actions/version), bakes it into the image (build arg + label), writes it to the
+# server's .env, and - only after build, deploy and health check succeeded - creates the git tag vX.Y.Z and a GitHub Release.
+# The same step that adds the staging-ok marker adds the ECR alias tag vX.Y.Z. Prod never computes anything: it reads the version
+# back from the image's tags, so staging and prod report the same string. Callers must grant `contents: write` and
+# `pull-requests: read` (a reusable workflow cannot raise the permissions it is given).
+#
 # Deploys are serialised per environment+service, run scripts/deploy-service.sh on the server over SSH with a pinned
 # host key, verify health, and roll back automatically if the new container is not healthy.
 
@@ -43,7 +50,7 @@ on:
         type: string
         default: ""
       set_release:
-        description: "also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)"
+        description: "also write APP_RELEASE=<tag> and RELEASE_VERSION=<version> (services that report a release through those global names, e.g. the backend). Every deploy also writes <PREFIX>_RELEASE_VERSION, see deploy-service.sh"
         type: boolean
         default: false
       migrate:
@@ -91,9 +98,15 @@ on:
       DD_API_KEY:
         description: "optional: posts a deployment event to Datadog"
         required: false
+      DISCORD_WEBHOOK_URL:
+        description: "optional: posts the deploy result (and @here on a failed prod deploy) to a Discord channel"
+        required: false
     outputs:
       image_tag:
         value: ${{ jobs.resolve.outputs.tag }}
+      version:
+        description: "release version X.Y.Z (empty for an image built before versioning existed)"
+        value: ${{ jobs.release.outputs.version || jobs.resolve.outputs.version }}
 
 permissions:
   contents: read
@@ -112,6 +125,7 @@ jobs:
       sha: ${{ steps.r.outputs.sha }}
       tag: ${{ steps.r.outputs.tag }}
       build: ${{ steps.r.outputs.build }}
+      version: ${{ steps.r.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,6 +148,7 @@ jobs:
           AWS_REGION: ${{ inputs.aws_region }}
         run: |
           set -euo pipefail
+          VERSION=""
           image_exists() { aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" >/dev/null 2>&1; }
           on_main() {  # commit is contained in main, or main has exactly its content (squash merge)
             git merge-base --is-ancestor "$1" origin/main 2>/dev/null && return 0
@@ -170,6 +185,13 @@ jobs:
               image_exists "staging-ok-${SHA:0:12}" || { echo "::error::Commit ${SHA:0:12} was never verified on staging (marker staging-ok-${SHA:0:12} missing in ECR)."; exit 1; }
               image_exists "$TAG" || { echo "::error::Image $TAG missing in ECR."; exit 1; }
               on_main "$SHA" || { echo "::error::Commit ${SHA:0:12} is not on main. Merge staging into main first."; exit 1; }
+              # The release version staging gave this image is an ECR alias tag vX.Y.Z on it. Prod reuses it as is; an image from
+              # before versioning has none, which only means it reports its tag instead of a version.
+              VERSION="$(aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$TAG" \
+                           --query 'imageDetails[0].imageTags[]' --output text 2>/dev/null | tr '\t' '\n' \
+                           | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n1 || true)"
+              VERSION="${VERSION#v}"
+              [ -n "$VERSION" ] || echo "::warning::Image $TAG carries no version tag (built before versioning): it will report its image tag."
               ;;
             *) echo "::error::environment must be staging or prod"; exit 1 ;;
           esac
@@ -178,6 +200,7 @@ jobs:
             echo "sha=$SHA"
             echo "tag=$TAG"
             echo "build=$BUILD"
+            echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Deploy plan"
@@ -185,11 +208,83 @@ jobs:
             echo "- service: \`${{ inputs.service }}\`"
             echo "- commit: \`${SHA:0:12}\`"
             echo "- image: \`$REPO:$TAG\` (build needed: $BUILD)"
+            [ -z "$VERSION" ] || echo "- version: **$VERSION**"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  version:
+    name: Compute release version
+    needs: resolve
+    if: ${{ inputs.environment == 'staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Least privilege: reads the repository, its tags and its PRs; creates nothing (the tag is made by the `release` job).
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      kind: ${{ steps.v.outputs.kind }}
+      bump: ${{ steps.v.outputs.bump }}
+      previous: ${{ steps.v.outputs.previous }}
+      reused: ${{ steps.v.outputs.reused }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: zepruv/.github/.github/actions/aws-login@main
+        with:
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ inputs.aws_region }}
+
+      # Version aliases already in ECR count for the counter too, so a deleted git tag can never hand its number out again.
+      - name: List the version tags of the image repository
+        env:
+          REPO: ${{ inputs.ecr_repository }}
+          OUT_DIR: ${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          aws ecr describe-images --repository-name "$REPO" --query 'imageDetails[].imageTags[]' --output text \
+            | tr '\t' '\n' | grep -E '^v[0-9]' > "$OUT_DIR/ecr_tags.txt" || true
+          echo "ECR version tags: $(grep -c . "$OUT_DIR/ecr_tags.txt" || true)"
+
+      - id: v
+        uses: zepruv/.github/.github/actions/version@main
+        with:
+          mode: resolve
+          github_token: ${{ github.token }}
+          sha: ${{ needs.resolve.outputs.sha }}
+          role: staging
+          out_dir: ${{ runner.temp }}/release
+          extra_tags_file: ${{ runner.temp }}/release/ecr_tags.txt
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          KIND: ${{ steps.v.outputs.kind }}
+          REUSED: ${{ steps.v.outputs.reused }}
+        run: |
+          {
+            echo "### Release version"
+            echo "- version: **$VERSION** ($KIND; reusing an existing tag: $REUSED)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ inputs.service }}
+          path: ${{ runner.temp }}/release
+          retention-days: 1
 
   build:
     name: Build and push image
-    needs: resolve
+    needs: [resolve, version]
     if: ${{ needs.resolve.outputs.build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -221,14 +316,20 @@ jobs:
           tags: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ needs.resolve.outputs.tag }}
           build-args: |
             APP_RELEASE=${{ needs.resolve.outputs.tag }}
+            RELEASE_VERSION=${{ needs.version.outputs.version }}
+            APP_COMMIT=${{ needs.resolve.outputs.sha }}
             ${{ inputs.build_args }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=${{ inputs.ecr_repository }}
           cache-to: type=gha,mode=max,scope=${{ inputs.ecr_repository }}
 
   deploy:
     name: Deploy to ${{ inputs.environment }}
-    needs: [resolve, build]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    needs: [resolve, version, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.version.result == 'success' || needs.version.result == 'skipped') && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -251,6 +352,7 @@ jobs:
           SERVICE: ${{ inputs.service }}
           TAG_VAR: ${{ inputs.tag_var }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version || needs.resolve.outputs.version }}
           ECR_REPOSITORY: ${{ inputs.ecr_repository }}
           PULL_EXTRA: ${{ inputs.pull_extra }}
           PROFILE: ${{ inputs.profile }}
@@ -274,6 +376,7 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
 
           remote_args=(--env "$ENV_NAME" --service "$SERVICE" --tag-var "$TAG_VAR" --tag "$TAG" --registry "$REGISTRY" --ecr-repository "$ECR_REPOSITORY")
+          [ -n "$RELEASE_VERSION" ] && remote_args+=(--release-version "$RELEASE_VERSION")
           [ -n "$PROFILE" ] && remote_args+=(--profile "$PROFILE")
           [ -n "$PULL_EXTRA" ] && remote_args+=(--pull-extra "$PULL_EXTRA")
           [ "$SET_RELEASE" = "true" ] && remote_args+=(--set-release)
@@ -309,10 +412,60 @@ jobs:
           done
           echo "::error::$URL did not return 200 after the deploy"; exit 1
 
+  # Only here, after build + deploy + health check succeeded, does a version become real: a failed run never consumes a number.
+  release:
+    name: Tag and publish the release
+    needs: [resolve, version, deploy, verify]
+    if: ${{ inputs.environment == 'staging' && !cancelled() && needs.deploy.result == 'success' && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The one job that writes to the repository: it creates the tag and the GitHub Release, nothing else.
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      version: ${{ steps.m.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ inputs.service }}
+          path: ${{ runner.temp }}/release
+
+      - id: m
+        uses: zepruv/.github/.github/actions/version@main
+        with:
+          mode: mint
+          github_token: ${{ github.token }}
+          sha: ${{ needs.resolve.outputs.sha }}
+          out_dir: ${{ runner.temp }}/release
+          extra_tags_file: ${{ runner.temp }}/release/ecr_tags.txt
+          kind: ${{ needs.version.outputs.kind }}
+          version: ${{ needs.version.outputs.version }}
+          previous: ${{ needs.version.outputs.previous }}
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.m.outputs.version }}
+          CREATED: ${{ steps.m.outputs.created }}
+          MISMATCH: ${{ steps.m.outputs.mismatch }}
+        run: |
+          {
+            echo "### Release"
+            echo "- released **v$VERSION** (new tag: $CREATED)"
+            if [ "$MISMATCH" = true ]; then echo "- WARNING: the image was built with a different version number that was taken meanwhile; the running service reports the built one"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   mark-verified:
     name: Mark image as verified on staging
-    needs: [resolve, deploy, verify]
-    if: ${{ inputs.environment == 'staging' && !cancelled() && needs.deploy.result == 'success' && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
+    needs: [resolve, deploy, verify, release]
+    if: ${{ inputs.environment == 'staging' && !cancelled() && needs.deploy.result == 'success' && (needs.verify.result == 'success' || needs.verify.result == 'skipped') && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -337,9 +490,31 @@ jobs:
           aws ecr put-image --repository-name "$REPO" --image-tag "$MARKER" --image-manifest "$MANIFEST" >/dev/null
           echo "Tagged $REPO:$TAG as $MARKER: this commit can now be promoted to prod."
 
+      # Prod reads the version back from this alias, so it ships exactly the string staging reported.
+      - name: Add version alias tag
+        env:
+          REPO: ${{ inputs.ecr_repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VERSION" ] || { echo "::error::no release version to tag the image with"; exit 1; }
+          ALIAS="v${VERSION}"
+          digest() { aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true; }
+          IMAGE_DIGEST="$(digest "$TAG")"
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = None ]; then echo "::error::image $REPO:$TAG not found"; exit 1; fi
+          EXISTING="$(digest "$ALIAS")"
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != None ]; then
+            [ "$EXISTING" = "$IMAGE_DIGEST" ] || { echo "::error::$REPO:$ALIAS already points at a different image ($EXISTING); refusing to move a version alias"; exit 1; }
+            echo "$ALIAS already present"; exit 0
+          fi
+          MANIFEST="$(aws ecr batch-get-image --repository-name "$REPO" --image-ids "imageTag=$TAG" --query 'images[0].imageManifest' --output text)"
+          aws ecr put-image --repository-name "$REPO" --image-tag "$ALIAS" --image-manifest "$MANIFEST" >/dev/null
+          echo "Tagged $REPO:$TAG as $ALIAS."
+
   datadog-event:
     name: Datadog deployment event
-    needs: [resolve, deploy]
+    needs: [resolve, version, deploy]
     if: ${{ always() && needs.deploy.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -354,13 +529,48 @@ jobs:
           ENV_NAME: ${{ inputs.environment }}
           SERVICE: ${{ inputs.service }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version || needs.resolve.outputs.version }}
           RESULT: ${{ needs.deploy.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ "$RESULT" = "success" ]; then TYPE=success; else TYPE=error; fi
-          payload="$(jq -n --arg t "Deploy $SERVICE to $ENV_NAME: $RESULT" --arg x "Version $TAG. $RUN_URL" \
-            --arg env "env:$ENV_NAME" --arg svc "service:$SERVICE" --arg ver "version:$TAG" --arg type "$TYPE" \
+          payload="$(jq -n --arg t "Deploy $SERVICE to $ENV_NAME: $RESULT" --arg x "Version ${VERSION:-$TAG} ($TAG). $RUN_URL" \
+            --arg env "env:$ENV_NAME" --arg svc "service:$SERVICE" --arg ver "version:${VERSION:-$TAG}" --arg type "$TYPE" \
             '{title:$t, text:$x, alert_type:$type, tags:[$env,$svc,$ver,"source:github-actions"]}')"
           curl -fsS -X POST "https://api.${DD_SITE}/api/v1/events" -H "Content-Type: application/json" \
             -H "DD-API-KEY: ${DD_API_KEY}" -d "$payload" >/dev/null
+
+  notify-discord:
+    name: Discord deploy notice
+    needs: [resolve, version, deploy, verify]
+    if: ${{ always() && needs.deploy.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      - name: Post result (optional)
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        continue-on-error: true
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ needs.version.outputs.version || needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DEPLOY: ${{ needs.deploy.result }}
+          VERIFY: ${{ needs.verify.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$DEPLOY" = "success" ] && { [ "$VERIFY" = "success" ] || [ "$VERIFY" = "skipped" ]; }; then
+            color=3066993; title="Deployed $SERVICE to $ENV_NAME"; ping=""
+          else
+            color=15158332; title="DEPLOY FAILED: $SERVICE on $ENV_NAME"
+            # only a failed production deploy pages; a failed staging deploy posts quietly
+            if [ "$ENV_NAME" = "prod" ] || [ "$ENV_NAME" = "production" ]; then ping="@here"; else ping=""; fi
+          fi
+          payload="$(jq -n --arg t "$title" --arg d "Version ${VERSION:-$TAG} ($TAG)\nDeploy: $DEPLOY, health check: $VERIFY" \
+            --arg u "$RUN_URL" --argjson c "$color" --arg p "$ping" \
+            '{content:$p, embeds:[{title:$t, description:$d, url:$u, color:$c}]}')"
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK_URL" >/dev/null

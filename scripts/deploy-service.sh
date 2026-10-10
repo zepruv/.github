@@ -18,7 +18,12 @@
 #   --ecr-repository <name>       e.g. zepruv-backend (bare repo name, no registry/tag) - used only to find this
 #                                  service's own old local images for retention pruning; harmless to omit (skips it)
 #   [--profile <name>]            compose profile the service belongs to (e.g. full)
-#   [--set-release]               also write APP_RELEASE=<tag> (services that report a release, e.g. the backend)
+#   [--release-version <X.Y.Z>]   human-readable release version (computed by compute-version.sh, same string on staging and prod).
+#                                  Written as <PREFIX>_RELEASE_VERSION, where PREFIX is --tag-var without _TAG (INTERVIEWER_TAG ->
+#                                  INTERVIEWER_RELEASE_VERSION): the .env is shared by every service of the environment, so each
+#                                  service gets its own variable, and its compose entry reads RELEASE_VERSION from it.
+#   [--set-release]               also write APP_RELEASE=<tag> and RELEASE_VERSION=<version, or the tag when no version was given>
+#                                  (services that report a release through those global names, e.g. the backend)
 #   [--migrate]                   before starting the new container, apply the database migrations the image ships (/migrations,
 #                                  run by /migrations/run.sh inside postgres:16-alpine). Needs MIGRATION_DATABASE_URL in .env; if it is
 #                                  missing the step is skipped with a notice. A failed migration stops the deploy and keeps the old version.
@@ -31,7 +36,7 @@
 set -euo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/zepruv/deploy/environments}"
-ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" SET_RELEASE=0 MIGRATE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
+ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" RELEASE_VERSION="" SET_RELEASE=0 MIGRATE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
 
 die() { echo "deploy-service: $*" >&2; exit 1; }
 
@@ -44,6 +49,7 @@ while [ $# -gt 0 ]; do
     --registry) REGISTRY="${2:-}"; shift 2 ;;
     --ecr-repository) ECR_REPOSITORY="${2:-}"; shift 2 ;;
     --profile) PROFILE="${2:-}"; shift 2 ;;
+    --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
     --set-release) SET_RELEASE=1; shift ;;
     --migrate) MIGRATE=1; shift ;;
     --wait) WAIT_SECONDS="${2:-}"; shift 2 ;;
@@ -61,6 +67,8 @@ done
 [[ "$REGISTRY" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$ ]] || die "invalid --registry"
 [[ -z "$ECR_REPOSITORY" || "$ECR_REPOSITORY" =~ ^[a-z0-9][a-z0-9._-]{0,254}$ ]] || die "invalid --ecr-repository"
 [[ -z "$PROFILE" || "$PROFILE" =~ ^[a-z0-9-]+$ ]] || die "invalid --profile"
+[[ -z "$RELEASE_VERSION" || "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] || die "invalid --release-version (expected X.Y.Z)"
+VERSION_VAR="${TAG_VAR%_TAG}_RELEASE_VERSION"
 [[ "$WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "invalid --wait"
 [[ "$KEEP_IMAGES" =~ ^[0-9]{1,2}$ && "$KEEP_IMAGES" -ge 1 ]] || die "invalid --keep (must be >= 1)"
 for pair in $PULL_EXTRA; do
@@ -76,6 +84,14 @@ cd "$DIR"
 # One deploy at a time per environment
 exec 9>.deploy.lock
 flock -n 9 || die "another deployment is running in $ENV_NAME"
+
+restore_release() {  # put the release variables back to what they were before this deploy
+  set_env "$VERSION_VAR" "$PREVIOUS_VERSION"
+  if [ "$SET_RELEASE" -eq 1 ]; then
+    if [ -n "$PREVIOUS_RELEASE" ]; then set_env APP_RELEASE "$PREVIOUS_RELEASE"; fi
+    if [ -n "$PREVIOUS_GLOBAL_VERSION" ]; then set_env RELEASE_VERSION "$PREVIOUS_GLOBAL_VERSION"; fi
+  fi
+}
 
 compose() {
   if [ -n "$PROFILE" ]; then docker compose --profile "$PROFILE" "$@"; else docker compose "$@"; fi
@@ -181,6 +197,8 @@ unset ECR_PASSWORD
 
 PREVIOUS_TAG="$(get_env "$TAG_VAR")"
 PREVIOUS_RELEASE="$(get_env APP_RELEASE)"
+PREVIOUS_VERSION="$(get_env "$VERSION_VAR")"
+PREVIOUS_GLOBAL_VERSION="$(get_env RELEASE_VERSION)"
 echo "    previous $TAG_VAR: ${PREVIOUS_TAG:-<none>}"
 
 set_env ECR_REGISTRY "$REGISTRY"
@@ -188,14 +206,19 @@ set_env "$TAG_VAR" "$TAG"
 # the docker socket's group on THIS server (the judge joins it to start sandboxes); see infra-apply.sh
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"   # overridable for tests only
 if [ -e "$DOCKER_SOCK" ]; then set_env DOCKER_GID "$(stat -c %g "$DOCKER_SOCK")"; fi
-[ "$SET_RELEASE" -eq 1 ] && set_env APP_RELEASE "$TAG"
+# Always written, empty when the image has no version (an image from before versioning): compose then falls back to the tag.
+set_env "$VERSION_VAR" "$RELEASE_VERSION"
+if [ "$SET_RELEASE" -eq 1 ]; then
+  set_env APP_RELEASE "$TAG"
+  set_env RELEASE_VERSION "${RELEASE_VERSION:-$TAG}"
+fi
 
 compose pull "$SERVICE"
 
 if ! run_migrations; then
   echo "!! database migrations failed: NOT deploying $TAG. $SERVICE keeps running ${PREVIOUS_TAG:-its current version}." >&2
   if [ -n "$PREVIOUS_TAG" ]; then set_env "$TAG_VAR" "$PREVIOUS_TAG"; fi
-  if [ "$SET_RELEASE" -eq 1 ] && [ -n "$PREVIOUS_RELEASE" ]; then set_env APP_RELEASE "$PREVIOUS_RELEASE"; fi
+  restore_release
   exit 1
 fi
 
@@ -218,7 +241,7 @@ compose logs --tail=60 "$SERVICE" >&2 || true
 if [ -n "$PREVIOUS_TAG" ]; then
   echo "==> rolling back $SERVICE to $PREVIOUS_TAG" >&2
   set_env "$TAG_VAR" "$PREVIOUS_TAG"
-  if [ "$SET_RELEASE" -eq 1 ] && [ -n "$PREVIOUS_RELEASE" ]; then set_env APP_RELEASE "$PREVIOUS_RELEASE"; fi
+  restore_release
   compose up -d --no-deps "$SERVICE"
   if wait_healthy; then echo "==> rollback succeeded; $SERVICE is running $PREVIOUS_TAG" >&2; else echo "!! rollback ALSO unhealthy: manual intervention needed" >&2; fi
 else

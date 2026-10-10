@@ -33,6 +33,7 @@ jobs:
           bash scripts/test_deploy_service.sh
           bash scripts/test_infra_apply.sh
           bash scripts/test_promotion_gate.sh
+          bash scripts/test_compute_version.sh   # release versioning: pure rules + git/gh glue against a throw-away repository
 
   workflows:
     runs-on: ubuntu-latest
