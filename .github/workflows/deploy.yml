@@ -502,7 +502,7 @@ jobs:
           ALIAS="v${VERSION}"
           digest() { aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true; }
           IMAGE_DIGEST="$(digest "$TAG")"
-          [ -n "$IMAGE_DIGEST" ] && [ "$IMAGE_DIGEST" != None ] || { echo "::error::image $REPO:$TAG not found"; exit 1; }
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = None ]; then echo "::error::image $REPO:$TAG not found"; exit 1; fi
           EXISTING="$(digest "$ALIAS")"
           if [ -n "$EXISTING" ] && [ "$EXISTING" != None ]; then
             [ "$EXISTING" = "$IMAGE_DIGEST" ] || { echo "::error::$REPO:$ALIAS already points at a different image ($EXISTING); refusing to move a version alias"; exit 1; }

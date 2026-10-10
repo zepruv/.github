@@ -136,7 +136,7 @@ cmd_reuse() {
       *) die "reuse: unknown argument $1" ;;
     esac
   done
-  [ -n "$sha" ] && [ -n "$tags_file" ] || die "reuse: --sha and --tags are required"
+  if [ -z "$sha" ] || [ -z "$tags_file" ]; then die "reuse: --sha and --tags are required"; fi
   local t
   t="$(read_list "$tags_file" | awk -v s="$sha" '$2 == s {print $1}' | highest_triple)"
   if [ -n "$t" ]; then
