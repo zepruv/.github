@@ -99,7 +99,7 @@ jobs:
 
       - name: Known vulnerabilities in dependencies and the standard library
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   docker:
