@@ -59,6 +59,14 @@ class OtherProfiles(unittest.TestCase):
         self.assertIn("JS002", ids("node", "logger.info('t', { token })"))
         self.assertIn("JS003", ids("node", "logger.warn('sent', email)"))
 
+    def test_go(self):
+        self.assertIn("GO001", ids("go", '\tfmt.Println("started")'))
+        self.assertIn("GO001", ids("go", '\tlog.Printf("x %d", n)'))
+        self.assertNotIn("GO001", ids("go", '\tlog.Info("rt.start", "addr", cfg.Addr)'))
+        self.assertNotIn("GO001", ids("go", '\ts.log.Warn("rt.authorize.error", "err", err.Error())'))
+        self.assertIn("GO002", ids("go", '\tlog.Info("auth", "token", token)'))
+        self.assertIn("GO003", ids("go", '\tlog.Warn("sent", "to", email)'))
+
     def test_frontend(self):
         self.assertIn("FE001", ids("frontend", "console.log('jwt', token)"))
         self.assertEqual(ids("frontend", "console.log('hello')"), ["FE002"])
