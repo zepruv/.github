@@ -49,7 +49,24 @@ def parse_lcov(path: str) -> Tuple[int, int]:
     return hit, found
 
 
-PARSERS = {"jacoco": parse_jacoco, "cobertura": parse_cobertura, "lcov": parse_lcov}
+def parse_gocover(path: str) -> Tuple[int, int]:
+    """`go test -coverprofile`: a "mode:" line, then `file:start,end numStmts count`. Coverage is counted in statements."""
+    total = hit = 0
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw or raw.startswith("mode:"):
+                continue
+            parts = raw.rsplit(" ", 2)
+            if len(parts) != 3:
+                raise ValueError(f"unreadable coverage line: {raw[:60]}")
+            stmts, count = int(parts[1]), int(parts[2])
+            total += stmts
+            hit += stmts if count > 0 else 0
+    return hit, total
+
+
+PARSERS = {"jacoco": parse_jacoco, "cobertura": parse_cobertura, "lcov": parse_lcov, "gocover": parse_gocover}
 
 
 def evaluate(fmt: str, path: str, minimum: float) -> Tuple[bool, float, int, int]:

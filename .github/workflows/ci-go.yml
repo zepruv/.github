@@ -1,0 +1,129 @@
+name: "Reusable: Go service CI"
+
+# Go services (zepruv-realtime). Same gates as the Node services: secrets/vulnerabilities/code patterns, the logging standard on added lines,
+# formatting + vet + race-detector tests with a coverage floor, a known-vulnerability check of the dependencies, and an image scan.
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+      working_directory:
+        type: string
+        default: "."
+      coverage_min:
+        description: "Minimum statement coverage percent"
+        type: number
+        default: 60
+      docker_scan:
+        type: boolean
+        default: false
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-go-${{ inputs.service_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security
+    uses: zepruv/.github/.github/workflows/security.yml@main
+    with:
+      language: go
+      working_directory: ${{ inputs.working_directory }}
+
+  logging-standard:
+    name: Logging standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+      - name: Check added lines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_REF: ${{ github.sha }}
+        run: python3 .ci/scripts/check_logging_standard.py --profile go --base "$BASE" --head "$HEAD_REF"
+
+  test:
+    name: Format, vet, tests, vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zepruv/.github
+          path: .ci
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.working_directory }}/go.mod
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      - name: Formatting (gofmt)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "::error::Run gofmt -w on:"; echo "$unformatted"; exit 1; fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Tests with the race detector and coverage
+        run: go test ./... -race -covermode=atomic -coverprofile=coverage.out -count=1
+
+      - name: Coverage gate
+        env:
+          MIN: ${{ inputs.coverage_min }}
+          SERVICE: ${{ inputs.service_name }}
+        run: python3 "$GITHUB_WORKSPACE/.ci/scripts/check_coverage.py" --format gocover --file coverage.out --min "$MIN" --label "$SERVICE"
+
+      - name: Known vulnerabilities in dependencies and the standard library
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  docker:
+    name: Docker image scan
+    if: ${{ inputs.docker_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          CONTEXT: ${{ inputs.working_directory }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --pull -t "ci/${{ inputs.service_name }}:${{ github.sha }}" -f "$CONTEXT/$DOCKERFILE" "$CONTEXT"
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        env:
+          TRIVY_DETECTION_PRIORITY: comprehensive
+        with:
+          image-ref: ci/${{ inputs.service_name }}:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table

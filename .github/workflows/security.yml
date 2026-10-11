@@ -10,7 +10,7 @@ on:
   workflow_call:
     inputs:
       language:
-        description: "Semgrep ruleset: java | python | node | frontend"
+        description: "Semgrep ruleset: java | python | node | frontend | go"
         type: string
         default: node
       working_directory:
@@ -132,6 +132,7 @@ jobs:
             java)     packs+=(p/java) ;;
             python)   packs+=(p/python) ;;
             node)     packs+=(p/nodejs p/javascript) ;;
+            go)       packs+=(p/golang) ;;
             frontend) packs+=(p/javascript p/typescript p/react) ;;
             *) echo "unknown language: $LANGUAGE"; exit 2 ;;
           esac

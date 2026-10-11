@@ -9,6 +9,9 @@ COBERTURA = '<coverage lines-valid="200" lines-covered="150"></coverage>'
 LCOV = "SF:a.js\nLF:10\nLH:5\nend_of_record\nSF:b.js\nLF:10\nLH:10\nend_of_record\n"
 
 
+GOCOVER = "mode: atomic\nexample.com/svc/a.go:10.2,12.3 2 1\nexample.com/svc/a.go:14.2,16.3 3 0\nexample.com/svc/b.go:5.2,6.3 5 4\n"
+
+
 def write(content):
     f = tempfile.NamedTemporaryFile("w", delete=False, suffix=".rep")
     f.write(content)
@@ -26,6 +29,13 @@ class Coverage(unittest.TestCase):
     def test_cobertura_and_lcov(self):
         self.assertEqual(cc.evaluate("cobertura", write(COBERTURA), 75)[:2], (True, 75.0))
         self.assertEqual(cc.evaluate("lcov", write(LCOV), 75)[2:], (15, 20))
+
+    def test_go_profile_counts_statements_not_lines(self):
+        self.assertEqual(cc.evaluate("gocover", write(GOCOVER), 70)[2:], (7, 10))
+        self.assertTrue(cc.evaluate("gocover", write(GOCOVER), 70)[0])
+        self.assertFalse(cc.evaluate("gocover", write(GOCOVER), 71)[0])
+        with self.assertRaises(ValueError):
+            cc.evaluate("gocover", write("mode: set\nnonsense\n"), 10)
 
     def test_missing_or_empty_report_fails_closed(self):
         self.assertEqual(cc.main(["--format", "jacoco", "--file", "/nonexistent.xml", "--min", "0"]), 1)

@@ -140,6 +140,15 @@ NODE_RULES: List[Rule] = [
          _logs_raw_email(r"\blogger\.(?:debug|info|warn|error)\(")),
 ]
 
+GO_RULES: List[Rule] = [
+    Rule("GO001", "error", "fmt.Print*/println and the standard `log` package are not the service logger: use log/slog (structured JSON).",
+         _regex(r"(?<![\w.])(?:fmt\.(?:Print|Println|Printf)|println)\(|(?<![\w.])log\.(?:Print|Println|Printf|Fatal|Fatalf|Fatalln|Panic|Panicf)\(")),
+    Rule("GO002", "error", "Do not log secrets (password/token/api key/authorization). Log presence or a hash instead.",
+         _logs_sensitive(r"\b(?:log|logger|slog)\.(?:Debug|Info|Warn|Error)\(")),
+    Rule("GO003", "error", "Do not log a raw email address or message body: log the salted hash of the person, never the address.",
+         _logs_raw_email(r"\b(?:log|logger|slog)\.(?:Debug|Info|Warn|Error)\(")),
+]
+
 FRONTEND_RULES: List[Rule] = [
     Rule("FE001", "error", "Never write secrets or emails to the browser console (visible to anyone, and shipped to error reports).",
          _logs_sensitive(r"\bconsole\.(?:log|info|warn|error|debug)\(")),
@@ -151,6 +160,7 @@ PROFILES: Dict[str, Tuple[List[Rule], Callable[[str], bool]]] = {
     "java": (JAVA_RULES, lambda p: p.endswith(".java") and "/src/main/" in "/" + p),
     "python": (PY_RULES, lambda p: p.endswith(".py")),
     "node": (NODE_RULES, lambda p: p.endswith((".js", ".mjs", ".cjs", ".ts"))),
+    "go": (GO_RULES, lambda p: p.endswith(".go") and not p.endswith("_test.go")),
     "frontend": (FRONTEND_RULES, lambda p: p.endswith((".js", ".jsx", ".ts", ".tsx")) and "/src/" in "/" + p),
 }
 
