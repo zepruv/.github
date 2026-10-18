@@ -11,7 +11,7 @@
 set -euo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/zepruv/deploy/environments}"
-ENV_NAME="" SERVICES="rabbitmq redis livekit livekit-egress nginx datadog-agent" WAIT_SECONDS=180
+ENV_NAME="" SERVICES="rabbitmq redis livekit livekit-egress nginx datadog-agent sandbox-proxy" WAIT_SECONDS=180
 die() { echo "infra-apply: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
