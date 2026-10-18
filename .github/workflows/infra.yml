@@ -16,7 +16,7 @@ on:
       services:
         description: "compose services to (re)start after the sync"
         type: string
-        default: "rabbitmq redis livekit livekit-egress nginx datadog-agent"
+        default: "rabbitmq redis livekit livekit-egress nginx datadog-agent sandbox-proxy"
       files:
         description: "files under environments/<env>/ copied to the server"
         type: string
