@@ -65,6 +65,10 @@ on:
         description: "prod only: commit to promote. Empty = newest staging-verified commit that is on main"
         type: string
         default: ""
+      also_services:
+        description: "space-separated compose services that run the same image and are recreated after this one is healthy (e.g. the judge's sandbox-proxy); a service the environment does not define is skipped"
+        type: string
+        default: ""
       pull_extra:
         description: >-
           Space-separated "ecr_repo=local_tag" pairs pulled and re-tagged after this service's own deploy - for
@@ -355,6 +359,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.version.outputs.version || needs.resolve.outputs.version }}
           ECR_REPOSITORY: ${{ inputs.ecr_repository }}
           PULL_EXTRA: ${{ inputs.pull_extra }}
+          ALSO_SERVICES: ${{ inputs.also_services }}
           PROFILE: ${{ inputs.profile }}
           SET_RELEASE: ${{ inputs.set_release }}
           MIGRATE: ${{ inputs.migrate }}
@@ -379,6 +384,7 @@ jobs:
           [ -n "$RELEASE_VERSION" ] && remote_args+=(--release-version "$RELEASE_VERSION")
           [ -n "$PROFILE" ] && remote_args+=(--profile "$PROFILE")
           [ -n "$PULL_EXTRA" ] && remote_args+=(--pull-extra "$PULL_EXTRA")
+          [ -n "$ALSO_SERVICES" ] && remote_args+=(--also "$ALSO_SERVICES")
           [ "$SET_RELEASE" = "true" ] && remote_args+=(--set-release)
           [ "$MIGRATE" = "true" ] && remote_args+=(--migrate)
           printf -v REMOTE_ARGS '%q ' "${remote_args[@]}"

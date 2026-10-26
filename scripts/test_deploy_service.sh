@@ -5,7 +5,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 export DEPLOY_ROOT="$WORK/deploy"; mkdir -p "$DEPLOY_ROOT/staging" "$WORK/bin"
-export PATH="$WORK/bin:$PATH" FAKE_LOG="$WORK/docker.log"
+export PATH="$WORK/bin:$PATH" FAKE_LOG="$WORK/docker.log" PROXY_MARK="$WORK/proxy-up"
 
 # Fake docker: records every call. Health of the service comes from FAKE_HEALTH_<TAG> (default healthy).
 cat > "$WORK/bin/docker" <<'FAKE'
@@ -13,7 +13,9 @@ cat > "$WORK/bin/docker" <<'FAKE'
 echo "docker $*" >> "$FAKE_LOG"
 case "$*" in
   *"compose"*" ps -q"*) echo "container123" ;;
-  "inspect --format {{if .State.Health}}"*) tag="$(grep -E '^BACKEND_TAG=' "$DEPLOY_ROOT/staging/.env" | cut -d= -f2-)"; var="FAKE_HEALTH_${tag//[^A-Za-z0-9]/_}"; echo "${!var:-healthy}" ;;
+  *"compose"*" config --services"*) printf 'backend-server\nsandbox-proxy\n' ;;
+  *"compose"*"up -d --no-deps sandbox-proxy"*) : > "$PROXY_MARK" ;;
+  "inspect --format {{if .State.Health}}"*) if [ "${FAKE_ALSO_UNHEALTHY:-0}" = 1 ] && [ -e "$PROXY_MARK" ]; then echo unhealthy; exit 0; fi; tag="$(grep -E '^BACKEND_TAG=' "$DEPLOY_ROOT/staging/.env" | cut -d= -f2-)"; var="FAKE_HEALTH_${tag//[^A-Za-z0-9]/_}"; echo "${!var:-healthy}" ;;
   "login "*) cat >/dev/null ;;
   "create "*) echo "cid-mig" ;;
   "cp "*) mkdir -p "${@: -1}" ;;
@@ -101,5 +103,28 @@ FAKE_MIGRATE_FAIL=1 run "${ARGS[@]}" --ecr-repository zepruv-backend --migrate -
 check "a failed migration exits 1" "[ $rc -eq 1 ]"
 check "a failed migration never recreates the service" "! grep -q 'up -d --no-deps backend-server' $FAKE_LOG"
 check "a failed migration puts the previous tag back" "grep -q '^BACKEND_TAG=prev-1$' $DEPLOY_ROOT/staging/.env && grep -q '^APP_RELEASE=prev-1$' $DEPLOY_ROOT/staging/.env"
+
+# --- --also: other services that run the same image are refreshed after the main one is healthy ---
+reset_env; : > "$FAKE_LOG"; rm -f "$PROXY_MARK"
+run "${ARGS[@]}" --tag sha-fff666666666 --also "sandbox-proxy not-here" >/dev/null 2>&1; rc=$?
+check "--also: deploy with a healthy extra service exits 0" "[ $rc -eq 0 ]"
+check "--also: the extra service is recreated with --no-deps" "grep -q 'up -d --no-deps sandbox-proxy' $FAKE_LOG"
+check "--also: the main service is recreated first" "[ \$(grep -n 'up -d --no-deps backend-server' $FAKE_LOG | head -1 | cut -d: -f1) -lt \$(grep -n 'up -d --no-deps sandbox-proxy' $FAKE_LOG | head -1 | cut -d: -f1) ]"
+check "--also: a service the environment does not define is skipped, not started" "! grep -q 'up -d --no-deps not-here' $FAKE_LOG"
+
+reset_env; : > "$FAKE_LOG"; rm -f "$PROXY_MARK"
+FAKE_ALSO_UNHEALTHY=1 run "${ARGS[@]}" --tag sha-ggg777777777 --also sandbox-proxy >/dev/null 2>&1; rc=$?
+check "--also: an extra service that does not come up healthy fails the deploy" "[ $rc -eq 1 ]"
+check "--also: the main service stays on the new tag (it is healthy)" "grep -q '^BACKEND_TAG=sha-ggg777777777$' $DEPLOY_ROOT/staging/.env"
+
+reset_env; : > "$FAKE_LOG"; rm -f "$PROXY_MARK"
+export FAKE_HEALTH_sha_hhh888888888=unhealthy
+run "${ARGS[@]}" --tag sha-hhh888888888 --also sandbox-proxy >/dev/null 2>&1; rc=$?
+check "--also: when the main service is unhealthy the extra service is not touched" "[ $rc -eq 1 ] && ! grep -q 'up -d --no-deps sandbox-proxy' $FAKE_LOG"
+
+for bad in "--also Bad_Name" "--also x;rm" "--also --tag"; do
+  args=("${ARGS[@]}" --tag ok-tag); eval "run ${args[*]} $bad" >/dev/null 2>&1; rc=$?
+  check "rejects $bad" "[ $rc -ne 0 ]"
+done
 
 exit $fail

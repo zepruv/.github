@@ -29,6 +29,10 @@
 #                                  missing the step is skipped with a notice. A failed migration stops the deploy and keeps the old version.
 #   [--wait <seconds>]            health wait, default 180
 #   [--keep <n>]                  local tagged images of this repo to retain (newest N), default 3
+#   [--also "svc ..."]            other compose services that run the SAME image (e.g. the judge's sandbox-proxy). The main deploy uses
+#                                  --no-deps, so without this they would keep the previous image for ever. After the main service is healthy
+#                                  each is recreated and checked; one the environment does not define is skipped. A failure exits non-zero
+#                                  (the main service stays on the new version).
 #   [--pull-extra "repo=local ..."]  space-separated repo=localtag pairs pulled (and re-tagged to localtag) after
 #                                  the main service deploy - e.g. judge's sandbox images, which its own code
 #                                  references by a bare local name (docker-images/build-all.sh's local tags), not
@@ -36,7 +40,7 @@
 set -euo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/zepruv/deploy/environments}"
-ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" RELEASE_VERSION="" SET_RELEASE=0 MIGRATE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA=""
+ENV_NAME="" SERVICE="" TAG_VAR="" TAG="" REGISTRY="" ECR_REPOSITORY="" PROFILE="" RELEASE_VERSION="" SET_RELEASE=0 MIGRATE=0 WAIT_SECONDS=180 KEEP_IMAGES=3 PULL_EXTRA="" ALSO=""
 
 die() { echo "deploy-service: $*" >&2; exit 1; }
 
@@ -55,6 +59,7 @@ while [ $# -gt 0 ]; do
     --wait) WAIT_SECONDS="${2:-}"; shift 2 ;;
     --keep) KEEP_IMAGES="${2:-}"; shift 2 ;;
     --pull-extra) PULL_EXTRA="${2:-}"; shift 2 ;;
+    --also) ALSO="${2:-}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -67,6 +72,7 @@ done
 [[ "$REGISTRY" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$ ]] || die "invalid --registry"
 [[ -z "$ECR_REPOSITORY" || "$ECR_REPOSITORY" =~ ^[a-z0-9][a-z0-9._-]{0,254}$ ]] || die "invalid --ecr-repository"
 [[ -z "$PROFILE" || "$PROFILE" =~ ^[a-z0-9-]+$ ]] || die "invalid --profile"
+[[ -z "$ALSO" || "$ALSO" =~ ^[a-z0-9][a-z0-9\ -]{0,200}$ ]] || die "invalid --also (compose service names separated by spaces)"
 [[ -z "$RELEASE_VERSION" || "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] || die "invalid --release-version (expected X.Y.Z)"
 VERSION_VAR="${TAG_VAR%_TAG}_RELEASE_VERSION"
 [[ "$WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "invalid --wait"
@@ -107,9 +113,9 @@ set_env() {  # set_env NAME VALUE : replace the line or append it, preserving fi
   mv "$tmp" .env
 }
 
-wait_healthy() {  # returns 0 when the container is healthy (or running for 20s if it has no healthcheck)
+wait_healthy() {  # returns 0 when the container is healthy (or running for 20s if it has no healthcheck); checks $1, default the main service
   local cid deadline status
-  cid="$(compose ps -q "$SERVICE" | head -n1)"
+  cid="$(compose ps -q "${1:-$SERVICE}" | head -n1)"
   [ -n "$cid" ] || return 1
   deadline=$(( $(date +%s) + WAIT_SECONDS ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -122,6 +128,23 @@ wait_healthy() {  # returns 0 when the container is healthy (or running for 20s 
     sleep 5
   done
   return 1
+}
+
+refresh_also_services() {  # recreate the other services that run this image; returns non-zero if one did not come up healthy
+  local s rc=0
+  for s in $ALSO; do
+    if ! compose config --services | grep -qx "$s"; then echo "    $s is not defined in $ENV_NAME: skipped"; continue; fi
+    echo "==> refreshing $s on $TAG"
+    compose up -d --no-deps "$s"
+    if wait_healthy "$s"; then
+      echo "==> $s is healthy on $TAG"
+    else
+      echo "!! $s did not become healthy within ${WAIT_SECONDS}s (the main service $SERVICE is fine and stays on $TAG)" >&2
+      compose logs --tail=60 "$s" >&2 || true
+      rc=1
+    fi
+  done
+  return $rc
 }
 
 prune_old_tagged_images() {  # keeps the newest $KEEP_IMAGES *tagged* local images of $REGISTRY/$ECR_REPOSITORY
@@ -227,13 +250,14 @@ compose up -d --no-deps "$SERVICE"
 if wait_healthy; then
   echo "==> $SERVICE is healthy on $TAG"
   printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$ENV_NAME" "$SERVICE" "$TAG" >> .deploy-history
+  also_rc=0; refresh_also_services || also_rc=1
   pull_extra_images
   prune_old_tagged_images
   # Dangling = no tag left at all. pull_extra_images moves each sandbox's :latest to the new image, orphaning the
   # previous one; nothing can roll back to an untagged image, and prune skips any image a container still uses.
   docker image prune -f >/dev/null || true
   compose ps "$SERVICE"
-  exit 0
+  exit "$also_rc"
 fi
 
 echo "!! $SERVICE did not become healthy within ${WAIT_SECONDS}s" >&2
