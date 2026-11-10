@@ -132,6 +132,9 @@ jobs:
   resolve:
     name: Resolve image
     runs-on: ubuntu-latest
+    # Production runs in the GitHub environment 'prod' (required reviewers, branch rule) and the AWS deploy role trusts only that environment's OIDC subject, so an unapproved run
+    # cannot even get an AWS session. Staging gets an empty value = no environment: its OIDC subject is unchanged (checked on a real run).
+    environment: ${{ inputs.environment == 'prod' && 'prod' || '' }}
     timeout-minutes: 10
     outputs:
       sha: ${{ steps.r.outputs.sha }}
@@ -299,6 +302,9 @@ jobs:
     needs: [resolve, version]
     if: ${{ needs.resolve.outputs.build == 'true' }}
     runs-on: ubuntu-latest
+    # Production runs in the GitHub environment 'prod' (required reviewers, branch rule) and the AWS deploy role trusts only that environment's OIDC subject, so an unapproved run
+    # cannot even get an AWS session. Staging gets an empty value = no environment: its OIDC subject is unchanged (checked on a real run).
+    environment: ${{ inputs.environment == 'prod' && 'prod' || '' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -343,6 +349,9 @@ jobs:
     needs: [resolve, version, build]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.version.result == 'success' || needs.version.result == 'skipped') && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-latest
+    # Production runs in the GitHub environment 'prod' (required reviewers, branch rule) and the AWS deploy role trusts only that environment's OIDC subject, so an unapproved run
+    # cannot even get an AWS session. Staging gets an empty value = no environment: its OIDC subject is unchanged (checked on a real run).
+    environment: ${{ inputs.environment == 'prod' && 'prod' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
