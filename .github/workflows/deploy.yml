@@ -99,6 +99,14 @@ on:
         required: true
       SSH_USER:
         required: false
+      CF_ACCESS_CLIENT_ID:
+        description: "optional (production): Cloudflare Access service token; when set, SSH goes through the tunnel (see .github/actions/ssh-access)"
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+      SSH_JUMP_HOST:
+        description: "optional (production): tunnel host name to enter through when SSH_HOST is a private address of another server"
+        required: false
       DD_API_KEY:
         description: "optional: posts a deployment event to Datadog"
         required: false
@@ -350,8 +358,18 @@ jobs:
           secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           region: ${{ inputs.aws_region }}
 
+      - name: Prepare SSH through Cloudflare Access (only when configured)
+        uses: zepruv/.github/.github/actions/ssh-access@main
+        with:
+          client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          target_host: ${{ secrets.SSH_HOST }}
+          jump_host: ${{ secrets.SSH_JUMP_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+
       - name: Deploy over SSH
         env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           ENV_NAME: ${{ inputs.environment }}
           SERVICE: ${{ inputs.service }}
           TAG_VAR: ${{ inputs.tag_var }}

@@ -1,0 +1,57 @@
+name: SSH through Cloudflare Access (optional)
+description: >
+  Production servers have no open SSH port: CI reaches them through a Cloudflare Tunnel protected by Cloudflare Access, using a service token.
+  When a token is given, this installs a pinned cloudflared, and writes ~/.ssh/config so that "ssh deploy@<tunnel hostname>" goes through Access, and so that the
+  other hosts (reached by private address) are entered through the tunnel host (ProxyJump). When no token is given it does nothing at all, so staging keeps its direct SSH.
+  The step that runs ssh must also have TUNNEL_SERVICE_TOKEN_ID and TUNNEL_SERVICE_TOKEN_SECRET in its environment (cloudflared reads them; they never go in a file).
+inputs:
+  client_id:
+    description: "Cloudflare Access service token id (empty = direct SSH, nothing is installed)"
+    required: false
+    default: ""
+  target_host:
+    description: "the SSH_HOST secret"
+    required: true
+  jump_host:
+    description: "optional: the tunnel hostname to enter through when target_host is a private address of another server"
+    required: false
+    default: ""
+  ssh_user:
+    description: "the SSH_USER secret"
+    required: false
+    default: "ubuntu"
+runs:
+  using: composite
+  steps:
+    - name: Install cloudflared and write the SSH config (only when a token is configured)
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.client_id }}
+        TARGET: ${{ inputs.target_host }}
+        JUMP: ${{ inputs.jump_host }}
+        SSH_USER: ${{ inputs.ssh_user }}
+      run: |
+        set -euo pipefail
+        if [ -z "$CLIENT_ID" ]; then echo "direct SSH (no Cloudflare Access token configured)"; exit 0; fi
+        # host names go into a file: refuse anything that is not a plain host name or address
+        [[ "$TARGET" =~ ^[A-Za-z0-9.-]{1,253}$ ]] || { echo "::error::SSH_HOST is not a plain host name or address"; exit 1; }
+        [ -z "$JUMP" ] || [[ "$JUMP" =~ ^[A-Za-z0-9.-]{1,253}$ ]] || { echo "::error::SSH_JUMP_HOST is not a plain host name"; exit 1; }
+        [[ "${SSH_USER:-ubuntu}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::SSH_USER is not a plain user name"; exit 1; }
+        # pinned release and checksum (verified against the value GitHub publishes for the release asset); bump both together
+        VERSION="2026.10.7"
+        SHA256="1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872"
+        curl -fsSL -o "$RUNNER_TEMP/cloudflared" "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64"
+        echo "${SHA256}  $RUNNER_TEMP/cloudflared" | sha256sum -c -
+        sudo install -m 0755 "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
+        install -m 700 -d "$HOME/.ssh"
+        ACCESS_HOST="${JUMP:-$TARGET}"
+        {
+          echo "Host ${ACCESS_HOST}"
+          echo "  ProxyCommand cloudflared access ssh --hostname %h"
+          if [ -n "$JUMP" ]; then
+            echo "Host ${TARGET}"
+            echo "  ProxyJump ${SSH_USER:-ubuntu}@${JUMP}"
+          fi
+        } >> "$HOME/.ssh/config"
+        chmod 600 "$HOME/.ssh/config"
+        echo "SSH to ${TARGET} goes through Cloudflare Access (entry: ${ACCESS_HOST})"
