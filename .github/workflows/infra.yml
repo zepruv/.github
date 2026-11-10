@@ -35,6 +35,14 @@ on:
       aws_region:
         type: string
         default: "ap-south-2"
+      source_dir:
+        description: "folder in the calling repo holding the files to copy (default environments/<environment>); production hosts use environments/prod/<app|media|compute>"
+        type: string
+        default: ""
+      ssm_path:
+        description: "SSM path to read the variables from (default <ssm_root>/<environment>/); production hosts use /zepruv/prod/<app|media|compute>/ so a host receives only its own secrets"
+        type: string
+        default: ""
     secrets:
       AWS_ROLE_ARN:
         required: false
@@ -49,6 +57,14 @@ on:
       SSH_HOST:
         required: false
       SSH_USER:
+        required: false
+      CF_ACCESS_CLIENT_ID:
+        description: "optional (production): Cloudflare Access service token; when set, SSH goes through the tunnel (see .github/actions/ssh-access)"
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+      SSH_JUMP_HOST:
+        description: "optional (production): tunnel host name to enter through when SSH_HOST is a private address of another server"
         required: false
 
 permissions:
@@ -97,21 +113,35 @@ jobs:
         env:
           ENV_NAME: ${{ inputs.environment }}
           SSM_ROOT: ${{ inputs.ssm_root }}
+          SSM_PATH: ${{ inputs.ssm_path }}
           MIN_KEYS: ${{ inputs.min_keys }}
           REGION: ${{ inputs.aws_region }}
         run: |
           set -euo pipefail
           umask 077
           path="${SSM_ROOT}/${ENV_NAME}/"
+          [ -z "$SSM_PATH" ] || path="$SSM_PATH"
           aws ssm get-parameters-by-path --path "$path" --with-decryption --region "$REGION" --output json > "$RUNNER_TEMP/ssm.json"
           python3 .ci/scripts/ssm_to_env.py --path "$path" --min-keys "$MIN_KEYS" < "$RUNNER_TEMP/ssm.json" > "$RUNNER_TEMP/env.lines"
           rm -f "$RUNNER_TEMP/ssm.json"
           echo "Variables that will be written (names only):"
           cut -d= -f1 "$RUNNER_TEMP/env.lines" | sed 's/^/  - /'
 
+      - name: Prepare SSH through Cloudflare Access (only when configured)
+        if: ${{ !inputs.dry_run }}
+        uses: zepruv/.github/.github/actions/ssh-access@main
+        with:
+          client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          target_host: ${{ secrets.SSH_HOST }}
+          jump_host: ${{ secrets.SSH_JUMP_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+
       - name: Copy configuration files and apply
         if: ${{ !inputs.dry_run }}
         env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SOURCE_DIR_IN: ${{ inputs.source_dir }}
           ENV_NAME: ${{ inputs.environment }}
           SERVICES: ${{ inputs.services }}
           FILES: ${{ inputs.files }}
@@ -130,11 +160,13 @@ jobs:
               -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 "${SSH_USER:-ubuntu}@${HOST}" "$@"
           }
           DIR="/opt/zepruv/deploy/environments/${ENV_NAME}"
+          SRC="${SOURCE_DIR_IN:-environments/${ENV_NAME}}"
+          [[ "$SRC" =~ ^environments/[A-Za-z0-9._/-]+$ ]] && [[ "$SRC" != *..* ]] || { echo "::error::source_dir must be a folder under environments/"; exit 1; }
 
           # shellcheck disable=SC2086
-          for f in $FILES; do [ -f "environments/${ENV_NAME}/$f" ] || { echo "::error::environments/${ENV_NAME}/$f is missing in this repo"; exit 1; }; done
+          for f in $FILES; do [ -f "${SRC}/$f" ] || { echo "::error::${SRC}/$f is missing in this repo"; exit 1; }; done
           # shellcheck disable=SC2086
-          tar -C "environments/${ENV_NAME}" -cf - $FILES | ssh_run "rm -rf '${DIR}/.incoming' && install -d -m 700 '${DIR}/.incoming' && tar -xf - -C '${DIR}/.incoming' --no-same-owner"
+          tar -C "${SRC}" -cf - $FILES | ssh_run "rm -rf '${DIR}/.incoming' && install -d -m 700 '${DIR}/.incoming' && tar -xf - -C '${DIR}/.incoming' --no-same-owner"
 
           B64="$(base64 -w0 < .ci/scripts/infra-apply.sh)"
           printf -v REMOTE_ARGS '%q ' --env "$ENV_NAME" --services "$SERVICES"
