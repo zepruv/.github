@@ -180,7 +180,10 @@ jobs:
               if image_exists "$TAG"; then BUILD=false; else BUILD=true; fi
               ;;
             prod)
-              git fetch --quiet origin main
+              # The checkout above (fetch-depth: 0) already has origin/main. A fetch here may fail on private repos (credentials are not persisted),
+              # so try it quietly and only require that origin/main exists afterwards.
+              git fetch --quiet origin main 2>/dev/null || true
+              git rev-parse --verify --quiet origin/main >/dev/null || { echo "::error::origin/main is not available in the checkout"; exit 1; }
               BUILD=false
               SHA=""
               if [ -n "$INPUT_SHA" ]; then
