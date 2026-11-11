@@ -90,9 +90,22 @@ restore() {
 
 # shellcheck disable=SC2086
 if ! docker compose up -d --wait --wait-timeout "$WAIT_SECONDS" $SERVICES; then
-  docker compose ps >&2 || true
-  restore
-  exit 1
+  # A one-shot service (for example queue-tls-init) exits 0 by design, and --wait reports that as a failure. Accept the result when every
+  # requested container is running and healthy, or has exited with code 0. Anything else (unhealthy, restarting, exit code not 0) is a real failure.
+  accepted=0
+  if command -v jq >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if docker compose ps -a --format json $SERVICES 2>/dev/null \
+      | jq -es 'flatten | length > 0 and all(.[]; (.State == "running" and ((.Health // "") == "" or .Health == "healthy")) or (.State == "exited" and .ExitCode == 0))' >/dev/null 2>&1; then
+      accepted=1
+    fi
+  fi
+  if [ "$accepted" != 1 ]; then
+    docker compose ps >&2 || true
+    restore
+    exit 1
+  fi
+  echo "note: every requested container is healthy or finished successfully (one-shot services exit by design)"
 fi
 
 # bind-mounted config changes are not noticed by `up -d`
