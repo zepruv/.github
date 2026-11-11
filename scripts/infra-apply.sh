@@ -94,11 +94,19 @@ if ! docker compose up -d --wait --wait-timeout "$WAIT_SECONDS" $SERVICES; then
   # requested container is running and healthy, or has exited with code 0. Anything else (unhealthy, restarting, exit code not 0) is a real failure.
   accepted=0
   if command -v jq >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    if docker compose ps -a --format json $SERVICES 2>/dev/null \
-      | jq -es 'flatten | length > 0 and all(.[]; (.State == "running" and ((.Health // "") == "" or .Health == "healthy")) or (.State == "exited" and .ExitCode == 0))' >/dev/null 2>&1; then
-      accepted=1
-    fi
+    # Poll: the other services may still be starting (--wait gave up as soon as the one-shot exited). Accept when every requested container is
+    # running and healthy or finished with exit code 0; stop early on a real failure (exited non-zero, unhealthy, dead).
+    deadline=$((SECONDS + WAIT_SECONDS))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      # shellcheck disable=SC2086
+      verdict="$(docker compose ps -a --format json $SERVICES 2>/dev/null \
+        | jq -rs 'flatten | if length == 0 then "bad"
+                  elif all(.[]; (.State == "running" and ((.Health // "") == "" or .Health == "healthy")) or (.State == "exited" and .ExitCode == 0)) then "ok"
+                  elif any(.[]; .State == "dead" or .State == "restarting" or (.State == "exited" and .ExitCode != 0) or .Health == "unhealthy") then "bad"
+                  else "wait" end' 2>/dev/null || echo bad)"
+      case "$verdict" in ok) accepted=1; break ;; bad) break ;; esac
+      sleep 3
+    done
   fi
   if [ "$accepted" != 1 ]; then
     docker compose ps >&2 || true
