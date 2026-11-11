@@ -48,9 +48,14 @@ runs:
         {
           echo "Host ${ACCESS_HOST}"
           echo "  ProxyCommand cloudflared access ssh --hostname %h"
+          # the jump hop is a separate ssh process that does NOT inherit the -i of the final command, so name the deploy key here too
+          echo "  IdentityFile ~/.ssh/deploy_key"
+          echo "  IdentitiesOnly yes"
           if [ -n "$JUMP" ]; then
             echo "Host ${TARGET}"
             echo "  ProxyJump ${SSH_USER:-ubuntu}@${JUMP}"
+            echo "  IdentityFile ~/.ssh/deploy_key"
+            echo "  IdentitiesOnly yes"
           fi
         } >> "$HOME/.ssh/config"
         chmod 600 "$HOME/.ssh/config"
