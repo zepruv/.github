@@ -45,7 +45,7 @@ on:
         default: "Dockerfile"
     secrets:
       CI_APP_ID:
-        description: "ID of the zepruv-ci-reader GitHub App; with CI_APP_PRIVATE_KEY it lets the install read the private zepruv/workspace-ui package. Optional."
+        description: "ID of the zepruv-ci-reader GitHub App; with CI_APP_PRIVATE_KEY it lets the install read the private zepruv/workspace-ui and zepruv/zepruv-chat packages. Optional."
         required: false
       CI_APP_PRIVATE_KEY:
         required: false
@@ -113,7 +113,7 @@ jobs:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: zepruv
-          repositories: workspace-ui
+          repositories: workspace-ui,zepruv-chat
 
       - name: Let npm fetch private zepruv packages
         if: ${{ steps.wsui.outputs.token != '' }}
