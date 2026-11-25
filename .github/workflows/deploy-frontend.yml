@@ -305,7 +305,7 @@ jobs:
             [ "$got" = "$BUILT_SHA" ] && { echo "ok: $HEALTH_URL serves this commit"; exit 0; }
             sleep 10
           done
-          echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, that no leftover DNS record blocks it, and - if this domain is behind Cloudflare Access - that CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET are set and the Access policy allows that Service Token."
+          echo "::error::$HEALTH_URL does not serve this commit. Check that the '$DEPLOY_ENV' block in wrangler.jsonc has this domain as a custom_domain route, that no leftover DNS record blocks it, that the zone route '*.zepruv.me/*' (wildcard institute domains) is not sending this hostname to another Worker (a new hostname needs its own route with no script: Cloudflare > Workers Routes > add '<host>/*', Worker: None), and - if this domain is behind Cloudflare Access - that CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET are set and the Access policy allows that Service Token."
           exit 1
 
   # Only after the deploy and the health check succeeded does the version become real: a failed run never consumes a number.
